@@ -325,7 +325,10 @@ impl NodeClient for HTTPNodeClient {
 			Ok(o) => Ok((o.last_retrieved_index, o.highest_index)),
 			Err(e) => {
 				// if we got anything other than 200 back from server, bye
-				error!("heightstopmmr: error contacting {} {}. Error: {}", url, addr, e);
+				error!(
+					"heightstopmmr: error contacting {} {}. Error: {}",
+					url, addr, e
+				);
 				let report = format!(": {}", e);
 				Err(libwallet::ErrorKind::ClientCallback(report))?
 			}
