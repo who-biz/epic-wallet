@@ -297,7 +297,12 @@ where
 			None => to_key(OUTPUT_PREFIX, &mut id.to_bytes().to_vec()),
 		};
 
-		Ok(self.db.get_ser(&key).unwrap().as_output_data().unwrap())
+		Ok(self
+			.db
+			.get_ser(&key)
+			.ok_or(ErrorKind::GenericError("Get returned nothing".to_string()))?
+			.as_output_data()
+			.unwrap())
 	}
 
 	fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = OutputData> + 'a> {
