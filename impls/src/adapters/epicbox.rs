@@ -42,6 +42,7 @@ use std::thread::JoinHandle;
 
 use crate::libwallet::api_impl::foreign;
 use crate::libwallet::api_impl::owner;
+use epic_wallet_util::epic_core::core::amount_to_hr_string;
 use std::net::TcpStream;
 use std::string::ToString;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -519,21 +520,21 @@ where
 		let version = slate.version();
 		let mut slate: Slate = slate.clone().into();
 
-		/*if slate.num_participants > slate.participant_data.len() {
-			println!(
+		if slate.num_participants > slate.participant_data.len() {
+			debug!(
 				"Slate [{}] received from [{}] for [{}] epics",
 				slate.id.to_string(),
-				display_from,
+				from.to_string(),
 				amount_to_hr_string(slate.amount, false)
 			);
 		} else {
-			println!(
+			debug!(
 				"Slate [{}] received back from [{}] for [{}] epics",
 				slate.id.to_string(),
-				display_from,
+				from.to_string(),
 				amount_to_hr_string(slate.amount, false)
 			);
-		};*/
+		};
 
 		if from.address_type() == AddressType::Epicbox {
 			EpicboxAddress::from_str(&from.to_string()).expect("invalid epicbox address");
@@ -549,26 +550,26 @@ where
 					self.publisher
 						.post_slate(&slate, from, false)
 						.map_err(|e| {
-							println!("{}: {}", "ERROR", e);
+							error!("{}: {}", "ERROR", e);
 							e
 						})
 						.expect("failed posting slate!");
 				} else {
-					println!("Slate [{}] finalized successfully", slate.id.to_string());
+					debug!("Slate [{}] finalized successfully", slate.id.to_string());
 				}
 				Ok(())
 			});
 
 		match result {
 			Ok(()) => {}
-			Err(e) => println!("{}", e),
+			Err(e) => error!("{}", e),
 		}
 	}
 
 	fn on_close(&self, reason: CloseReason) {
 		match reason {
 			CloseReason::Normal => {
-				//println!("Listener for {} stopped", self.name)
+				debug!("Listener for stopped, normal exit")
 			}
 			CloseReason::Abnormal(error) => {
 				error!("{:?}", error.to_string())
@@ -857,6 +858,9 @@ where
 		self.send(&request)
 			.expect("could not send subscribe request!");
 		self.tx.send(true).unwrap();
+
+		debug!(">>> (challenge_subscribe) called!");
+
 		Ok(())
 	}
 
@@ -871,6 +875,8 @@ where
 
 		self.send(&request)
 			.expect("could not send subscribe request!");
+
+		debug!(">>> (new_challenge) called!");
 
 		Ok(())
 	}
