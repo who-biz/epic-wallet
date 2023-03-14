@@ -675,6 +675,17 @@ impl EpicboxBroker {
 			tx: self.tx.clone(),
 		};
 
+		let subscribe = "7WUDtkSaKyGRUnQ22rE3QUXChV8DmA6NnunDYP4vheTpc";
+		let signature = sign_challenge(&subscribe, &secret_key)?.to_hex();
+
+		let request = ProtocolRequest::Subscribe {
+			address: client.address.public_key.to_string(),
+			signature,
+		};
+		client
+			.send(&request)
+			.expect("Could not send Subscribe request!");
+
 		let res = loop {
 			let err = client.sender.lock().read_message();
 			let mut new_challenge = false;
@@ -705,9 +716,10 @@ impl EpicboxBroker {
 
 						match response {
 							ProtocolResponse::Challenge { str } => {
+								debug!(">>> Challenge response received ({})", str.clone());
 								client.challenge = Some(str.clone());
 								client
-									.challenge_subscribe(&str)
+									.challenge_send()
 									.map_err(|_| {
 										error!("Error attempting to subscribe!");
 									})
@@ -715,8 +727,9 @@ impl EpicboxBroker {
 
 								if !first_run {
 									std::thread::sleep(duration);
+								} else {
+									new_challenge = true;
 								}
-								new_challenge = true;
 							}
 							ProtocolResponse::Slate {
 								from,
@@ -848,33 +861,35 @@ where
 	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
-	fn challenge_subscribe(&self, challenge: &str) -> Result<(), Error> {
-		let signature = sign_challenge(&challenge, &self.secret_key)?.to_hex();
-		let request = ProtocolRequest::Subscribe {
+	fn challenge_send(&self) -> Result<(), Error> {
+		//let signature = sign_challenge(&challenge, &self.secret_key)?.to_hex();
+		let request = ProtocolRequest::Challenge;
+
+		/*let request = ProtocolRequest::Subscribe {
 			address: self.address.public_key.to_string(),
 			signature,
-		};
+		};*/
 
 		self.send(&request)
 			.expect("could not send subscribe request!");
 		self.tx.send(true).unwrap();
 
-		debug!(">>> (challenge_subscribe) called!");
+		debug!(">>> (challenge_send) called!");
 
 		Ok(())
 	}
 
 	fn new_challenge(&self) -> Result<(), Error> {
-		let unsubscribe = ProtocolRequest::Unsubscribe {
+		/*let unsubscribe = ProtocolRequest::Unsubscribe {
 			address: self.address.public_key.to_string(),
 		};
 		self.send(&unsubscribe)
-			.expect("could not send unsubscribe request!");
+			.expect("could not send unsubscribe request!");*/
 
 		let request = ProtocolRequest::Challenge;
 
 		self.send(&request)
-			.expect("could not send subscribe request!");
+			.expect("Could not send Challenge request!");
 
 		debug!(">>> (new_challenge) called!");
 
