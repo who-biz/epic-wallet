@@ -24,7 +24,10 @@ use crate::libwallet::{
 	address, Address, AddressType, EpicboxAddress, TxProof, DEFAULT_EPICBOX_PORT_443,
 	DEFAULT_EPICBOX_PORT_80,
 };
-use crate::libwallet::{Error, ErrorKind, NodeClient, WalletInst, WalletLCProvider};
+use crate::libwallet::{NodeClient, WalletInst, WalletLCProvider};
+
+use crate::Error;
+use crate::ErrorKind;
 
 use crate::libwallet::{Slate, SlateVersion, VersionedSlate};
 use crate::util::secp::key::SecretKey;
@@ -39,7 +42,9 @@ use std::thread::JoinHandle;
 
 use crate::libwallet::api_impl::foreign;
 use crate::libwallet::api_impl::owner;
+use epic_wallet_util::epic_core::core::amount_to_hr_string;
 use std::net::TcpStream;
+use std::string::ToString;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::spawn;
 use tungstenite::connect;
@@ -60,6 +65,14 @@ use tungstenite::{Error as ErrorTungstenite, Message};
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+const CONNECTION_ERR_MSG: &str = "\nCan't connect to the epicbox server!\n\
+	Check your epic-wallet.toml settings and make sure epicbox domain is correct.\n";
+const DEFAULT_INTERVAL: u64 = 10;
+const MIN_INTERVAL: u64 = 2;
+const MAX_INTERVAL: u64 = 120;
+
+const DEFAULT_CHALLENGE_RAW: &str = "7WUDtkSaKyGRUnQ22rE3QUXChV8DmA6NnunDYP4vheTpc";
 
 /// Epicbox 'plugin' implementation
 pub enum CloseReason {
@@ -95,8 +108,9 @@ pub struct EpicboxChannel {
 
 #[derive(Clone)]
 pub struct EpicboxListenChannel {
-	_priv: (), // makes KeybaseAllChannels unconstructable without checking for existence of keybase executable
+	_priv: (),
 }
+
 impl EpicboxListenChannel {
 	pub fn new() -> Result<EpicboxListenChannel, Error> {
 		Ok(EpicboxListenChannel { _priv: () })
@@ -106,13 +120,14 @@ impl EpicboxListenChannel {
 		wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K> + 'static>>>,
 		keychain_mask: Arc<Mutex<Option<SecretKey>>>,
 		epicbox_config: EpicboxConfig,
+		interval_arg: Option<u64>,
 	) -> Result<(), Error>
 	where
 		L: WalletLCProvider<'static, C, K> + 'static,
 		C: NodeClient + 'static,
 		K: Keychain + 'static,
 	{
-		let (address, sec_key) = {
+		let (address, sec_key, interval) = {
 			let a_keychain = keychain_mask.clone();
 			let a_wallet = wallet.clone();
 			let mask = a_keychain.lock();
@@ -131,7 +146,13 @@ impl EpicboxListenChannel {
 				Some(epicbox_config.epicbox_domain.clone()),
 				epicbox_config.epicbox_port,
 			);
-			(address, sec_key)
+
+			let mut interval = interval_arg;
+			if interval.is_none() {
+				interval = epicbox_config.epicbox_listener_interval
+			}
+
+			(address, sec_key, interval)
 		};
 		let url = {
 			let cloned_address = address.clone();
@@ -149,21 +170,27 @@ impl EpicboxListenChannel {
 			}
 		};
 		let (tx, _rx): (Sender<bool>, Receiver<bool>) = channel();
-		let (socket, _response) = connect(url.clone()).expect("Can't connect to epicbox server!");
+
+		debug!("Connecting to the epicbox server at {} ..", url.clone());
+		let (socket, _response) = connect(url.clone()).map_err(|e| {
+			warn!("{}", ErrorKind::EpicboxTungstenite(format!("{}", e).into()));
+			ErrorKind::EpicboxTungstenite(format!("{}", e).into())
+		})?;
+
 		let publisher = EpicboxPublisher::new(address.clone(), sec_key, socket, tx)?;
 
 		let mut subscriber = EpicboxSubscriber::new(&publisher)?;
+
 		let container = Container::new(epicbox_config.clone());
 		let cpublisher = publisher.clone();
 		let mask = keychain_mask.lock();
 		let km = mask.clone();
 		let controller = EpicboxController::new(container, cpublisher, wallet, km)
 			.expect("Could not init epicbox listener!");
-		warn!("Epicbox listener started.");
-		subscriber
-			.start(controller)
-			.expect("Could not start epicbox listener!");
-		Ok(())
+
+		warn!("Starting epicbox listener for: {}", address);
+
+		subscriber.start(controller, interval)
 	}
 }
 impl EpicboxChannel {
@@ -237,7 +264,7 @@ where
 	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
-	let (address, sec_key) = {
+	let (address, sec_key, interval) = {
 		let a_wallet = wallet.clone();
 		let mut w_lock = a_wallet.lock();
 		let lc = w_lock.lc_provider()?;
@@ -249,12 +276,14 @@ where
 			.unwrap();
 		let pub_key = PublicKey::from_secret_key(k.secp(), &sec_key).unwrap();
 
+		let interval: Option<u64> = config.epicbox_listener_interval;
+
 		let address = EpicboxAddress::new(
 			pub_key.clone(),
 			Some(config.epicbox_domain.clone()),
 			config.epicbox_port,
 		);
-		(address, sec_key)
+		(address, sec_key, interval)
 	};
 	let url = {
 		let cloned_address = address.clone();
@@ -271,12 +300,12 @@ where
 			),
 		}
 	};
-	let (socket, _) = connect(url.clone()).expect("Can't connect to epicbox server");
+	debug!("Connecting to the epicbox server at {} ..", url.clone());
+	let (socket, _) = connect(url.clone()).expect(CONNECTION_ERR_MSG);
 
 	let publisher = EpicboxPublisher::new(address.clone(), sec_key, socket, tx)?;
 	let subscriber = EpicboxSubscriber::new(&publisher)?;
 
-	
 	let mut csubscriber = subscriber.clone();
 	let cpublisher = publisher.clone();
 
@@ -285,7 +314,7 @@ where
 			.expect("Could not init epicbox controller!");
 
 		csubscriber
-			.start(controller)
+			.start(controller, interval)
 			.expect("Could not start epicbox controller!");
 		()
 	});
@@ -297,6 +326,7 @@ where
 		handle,
 	}))
 }
+
 impl Listener for EpicboxListener {
 	/// keep :)
 	fn interface(&self) -> ListenerInterface {
@@ -325,7 +355,6 @@ impl EpicboxPublisher {
 	pub fn new(
 		address: EpicboxAddress,
 		secret_key: SecretKey,
-
 		socket: WebSocket<MaybeTlsStream<TcpStream>>,
 		tx: Sender<bool>,
 	) -> Result<Self, Error> {
@@ -454,7 +483,7 @@ where
 			if slate.tx.inputs().len() == 0 {
 				// TODO: invoicing
 			} else {
-				debug!("foreign::receive_tx");
+				info!("Received new transaction (foreign::receive_tx)");
 				let ret_slate = foreign::receive_tx(
 					&mut **w,
 					self.keychain_mask.as_ref(),
@@ -468,8 +497,10 @@ where
 
 			Ok(false)
 		} else {
-			debug!("owner::finalize_tx and owner::post_tx");
+			info!("Finalize transaction (owner::finalize_tx)");
 			let slate = owner::finalize_tx(&mut **w, self.keychain_mask.as_ref(), slate)?;
+
+			info!("Post transaction to the network (owner::post_tx)");
 			owner::post_tx(w.w2n_client(), &slate.tx, false)?;
 			Ok(true)
 		}
@@ -491,21 +522,21 @@ where
 		let version = slate.version();
 		let mut slate: Slate = slate.clone().into();
 
-		/*if slate.num_participants > slate.participant_data.len() {
-			println!(
+		if slate.num_participants > slate.participant_data.len() {
+			debug!(
 				"Slate [{}] received from [{}] for [{}] epics",
 				slate.id.to_string(),
-				display_from,
+				from.to_string(),
 				amount_to_hr_string(slate.amount, false)
 			);
 		} else {
-			println!(
+			debug!(
 				"Slate [{}] received back from [{}] for [{}] epics",
 				slate.id.to_string(),
-				display_from,
+				from.to_string(),
 				amount_to_hr_string(slate.amount, false)
 			);
-		};*/
+		};
 
 		if from.address_type() == AddressType::Epicbox {
 			EpicboxAddress::from_str(&from.to_string()).expect("invalid epicbox address");
@@ -521,26 +552,26 @@ where
 					self.publisher
 						.post_slate(&slate, from, false)
 						.map_err(|e| {
-							println!("{}: {}", "ERROR", e);
+							error!("{}: {}", "ERROR", e);
 							e
 						})
 						.expect("failed posting slate!");
 				} else {
-					println!("Slate [{}] finalized successfully", slate.id.to_string());
+					debug!("Slate [{}] finalized successfully", slate.id.to_string());
 				}
 				Ok(())
 			});
 
 		match result {
 			Ok(()) => {}
-			Err(e) => println!("{}", e),
+			Err(e) => error!("{}", e),
 		}
 	}
 
 	fn on_close(&self, reason: CloseReason) {
 		match reason {
 			CloseReason::Normal => {
-				//println!("Listener for {} stopped", self.name)
+				debug!("Listener for stopped, normal exit")
 			}
 			CloseReason::Abnormal(error) => {
 				error!("{:?}", error.to_string())
@@ -549,7 +580,11 @@ where
 	}
 }
 pub trait Subscriber {
-	fn start<P, L, C, K>(&mut self, handler: EpicboxController<P, L, C, K>) -> Result<(), Error>
+	fn start<P, L, C, K>(
+		&mut self,
+		handler: EpicboxController<P, L, C, K>,
+		interval: Option<u64>,
+	) -> Result<(), Error>
 	where
 		P: Publisher,
 		L: WalletLCProvider<'static, C, K> + 'static,
@@ -558,7 +593,11 @@ pub trait Subscriber {
 	fn stop(&self);
 }
 impl Subscriber for EpicboxSubscriber {
-	fn start<P, L, C, K>(&mut self, handler: EpicboxController<P, L, C, K>) -> Result<(), Error>
+	fn start<P, L, C, K>(
+		&mut self,
+		handler: EpicboxController<P, L, C, K>,
+		interval: Option<u64>,
+	) -> Result<(), Error>
 	where
 		P: Publisher,
 		L: WalletLCProvider<'static, C, K> + 'static,
@@ -566,8 +605,7 @@ impl Subscriber for EpicboxSubscriber {
 		K: Keychain + 'static,
 	{
 		self.broker
-			.subscribe(&self.address, &self.secret_key, handler)?;
-		Ok(())
+			.subscribe(&self.address, &self.secret_key, handler, interval)
 	}
 
 	fn stop(&self) {
@@ -608,6 +646,7 @@ impl EpicboxBroker {
 		address: &EpicboxAddress,
 		secret_key: &SecretKey,
 		handler: EpicboxController<P, L, C, K>,
+		interval: Option<u64>,
 	) -> Result<(), Error>
 	where
 		P: Publisher,
@@ -616,8 +655,18 @@ impl EpicboxBroker {
 		K: Keychain + 'static,
 	{
 		let handler = Arc::new(Mutex::new(handler));
-
 		let sender = self.inner.clone();
+		let mut first_run = true;
+
+		// Parse from epicbox config or use default value for the
+		// time interval between new subscribe calls from the wallet
+		let mut seconds = interval.unwrap_or(DEFAULT_INTERVAL);
+		if seconds < MIN_INTERVAL {
+			seconds = MIN_INTERVAL
+		} else if seconds > MAX_INTERVAL {
+			seconds = MAX_INTERVAL
+		}
+		let duration = std::time::Duration::from_secs(seconds);
 
 		let mut client = EpicboxClient {
 			sender,
@@ -628,7 +677,18 @@ impl EpicboxBroker {
 			tx: self.tx.clone(),
 		};
 
-		loop {
+		let subscribe = DEFAULT_CHALLENGE_RAW;
+		let signature = sign_challenge(&subscribe, &secret_key)?.to_hex();
+
+		let request = ProtocolRequest::Subscribe {
+			address: client.address.public_key.to_string(),
+			signature,
+		};
+		client
+			.send(&request)
+			.expect("Could not send Subscribe request!");
+
+		let res = loop {
 			let err = client.sender.lock().read_message();
 			let mut new_challenge = false;
 
@@ -643,7 +703,7 @@ impl EpicboxBroker {
 						Err(e) => error!("Client closed connection {:?}", e),
 					}
 
-					break;
+					break Err(ErrorKind::EpicboxWebsocketAbnormalTermination.into());
 				}
 				Ok(message) => match message {
 					Message::Text(_) | Message::Binary(_) => {
@@ -660,15 +720,17 @@ impl EpicboxBroker {
 							ProtocolResponse::Challenge { str } => {
 								client.challenge = Some(str.clone());
 								client
-									.challenge_subscribe(&str)
+									.challenge_send()
 									.map_err(|_| {
 										error!("Error attempting to subscribe!");
 									})
 									.unwrap();
-								//wait one minute before start new subscription
-								let duration = std::time::Duration::from_secs(60);
-								std::thread::sleep(duration);
-								new_challenge = true;
+
+								if !first_run {
+									std::thread::sleep(duration);
+								} else {
+									new_challenge = true;
+								}
 							}
 							ProtocolResponse::Slate {
 								from,
@@ -686,7 +748,7 @@ impl EpicboxBroker {
 								) {
 									Ok(x) => x,
 									Err(e) => {
-										error!("{}", e);
+										error!("{}", e.to_string());
 										return Ok(());
 									}
 								};
@@ -715,24 +777,26 @@ impl EpicboxBroker {
 						info!("Close {:?}", &message.to_string());
 						handler.lock().on_close(CloseReason::Normal);
 						client.sender.lock().close(None).unwrap();
-						break;
+						break Ok(());
 					}
 				},
 			};
 
 			if new_challenge {
-				info!("Refresh epicbox subscription!");
-
 				client
 					.new_challenge()
-					.map_err(|_| {
-						error!("error attempting challenge!");
-					})
+					.map_err(|_| error!("error attempting challenge!"))
 					.unwrap();
-			}
-		} //end loop
 
-		Ok(())
+				debug!("Refresh epicbox subscription (interval: {:?})", duration);
+				if first_run {
+					std::thread::sleep(duration);
+					first_run = false;
+				}
+			}
+		}; //end loop
+
+		res
 	}
 
 	fn post_slate(
@@ -798,31 +862,18 @@ where
 	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
-	fn challenge_subscribe(&self, challenge: &str) -> Result<(), Error> {
-		let signature = sign_challenge(&challenge, &self.secret_key)?.to_hex();
-		let request = ProtocolRequest::Subscribe {
-			address: self.address.public_key.to_string(),
-			signature,
-		};
-
+	fn challenge_send(&self) -> Result<(), Error> {
+		let request = ProtocolRequest::Challenge;
 		self.send(&request)
-			.expect("could not send subscribe request!");
+			.expect("could not send Challenge request!");
 		self.tx.send(true).unwrap();
 		Ok(())
 	}
 
 	fn new_challenge(&self) -> Result<(), Error> {
-		let unsubscribe = ProtocolRequest::Unsubscribe {
-			address: self.address.public_key.to_string(),
-		};
-		self.send(&unsubscribe)
-			.expect("could not send unsubscribe request!");
-
 		let request = ProtocolRequest::Challenge;
-
 		self.send(&request)
-			.expect("could not send subscribe request!");
-
+			.expect("Could not send Challenge request!");
 		Ok(())
 	}
 
