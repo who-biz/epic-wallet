@@ -173,16 +173,17 @@ where
 					}
 					Err(_e) => {
 						if reconnect >= 5 {
-							break;
+							//break;
 						} else {
 							reconnect += 1;
 						}
+						debug!("Reconnect count ({})", reconnect);
 					}
 				}
 				let duration = std::time::Duration::from_secs(20);
 				std::thread::sleep(duration);
 			}
-			Ok(())
+			//Ok(())
 		}
 		method => {
 			return Err(ErrorKind::ArgumentError(format!(
