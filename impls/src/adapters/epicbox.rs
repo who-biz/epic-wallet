@@ -117,6 +117,7 @@ impl EpicboxListenChannel {
 		wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K> + 'static>>>,
 		keychain_mask: Arc<Mutex<Option<SecretKey>>>,
 		epicbox_config: EpicboxConfig,
+		reconnections: &mut u32,
 	) -> Result<(), Error>
 	where
 		L: WalletLCProvider<'static, C, K> + 'static,
@@ -165,6 +166,7 @@ impl EpicboxListenChannel {
 		debug!("Connecting to the epicbox server at {} ..", url.clone());
 		let (socket, _response) = connect(url.clone()).map_err(|e| {
 			warn!("{}", ErrorKind::EpicboxTungstenite(format!("{}", e).into()));
+			*reconnections += 1;
 			ErrorKind::EpicboxTungstenite(format!("{}", e).into())
 		})?;
 
@@ -176,7 +178,7 @@ impl EpicboxListenChannel {
 		let cpublisher = publisher.clone();
 		let mask = keychain_mask.lock();
 		let km = mask.clone();
-		let controller = EpicboxController::new(container, cpublisher, wallet, km)
+		let controller = EpicboxController::new(container, cpublisher, wallet, km, *reconnections)
 			.expect("Could not init epicbox listener!");
 
 		warn!("Starting epicbox listener for: {}", address);
@@ -297,10 +299,12 @@ where
 
 	let mut csubscriber = subscriber.clone();
 	let cpublisher = publisher.clone();
+	let mut reconnections = 0;
 
 	let handle = spawn(move || {
-		let controller = EpicboxController::new(container, cpublisher, wallet, keychain_mask)
-			.expect("Could not init epicbox controller!");
+		let controller =
+			EpicboxController::new(container, cpublisher, wallet, keychain_mask, reconnections)
+				.expect("Could not init epicbox controller!");
 
 		csubscriber
 			.start(controller)
@@ -393,6 +397,7 @@ where
 	pub wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K> + 'static>>>,
 	/// Keychain mask
 	pub keychain_mask: Option<SecretKey>,
+	pub reconnections: u32,
 }
 pub struct Container {
 	pub config: EpicboxConfig,
@@ -449,11 +454,13 @@ where
 		publisher: P,
 		wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K> + 'static>>>,
 		keychain_mask: Option<SecretKey>,
+		reconnections: u32,
 	) -> Result<Self, Error> {
 		Ok(Self {
 			publisher,
 			wallet,
 			keychain_mask,
+			reconnections,
 		})
 	}
 
@@ -637,6 +644,7 @@ impl EpicboxBroker {
 		let handler = Arc::new(Mutex::new(handler));
 		let sender = self.inner.clone();
 		let mut first_run = true;
+		//handler.reconnections = Cell::new(0);
 
 		// time interval for sleep in main loop
 		let duration = std::time::Duration::from_secs(DEFAULT_INTERVAL);
@@ -667,7 +675,12 @@ impl EpicboxBroker {
 
 			match err {
 				Err(e) => {
-					error!("Error reading message {:?}", e);
+					handler.lock().reconnections += 1;
+					error!(
+						"Error reading message {:?}, Reconnect counter ({})",
+						e,
+						handler.lock().reconnections
+					);
 					handler.lock().on_close(CloseReason::Abnormal(
 						ErrorKind::EpicboxWebsocketAbnormalTermination.into(),
 					));
@@ -688,6 +701,11 @@ impl EpicboxBroker {
 									return Ok(());
 								}
 							};
+						handler.lock().reconnections = 0;
+						debug!(
+							"Connection successful, reconnect counter ({})",
+							handler.lock().reconnections
+						);
 
 						match response {
 							ProtocolResponse::Challenge { str } => {

@@ -158,31 +158,29 @@ where
 			KeybaseAllChannels::new()?.listen(wallet.clone(), keychain_mask.clone(), config.clone())
 		}
 		"epicbox" => {
-			let mut reconnect = 0;
+			let mut reconnections = 0;
 			loop {
 				let listener = EpicboxListenChannel::new()?.listen(
 					wallet.clone(),
 					keychain_mask.clone(),
 					epicbox_config.clone(),
+					&mut reconnections,
 				);
 				warn!("try to reconnect to epicbox");
 				match listener {
-					Ok(_) => {
-						reconnect = 0;
-						()
+					Err(e) => {
+						warn!("Error in listener loop ({})", e);
 					}
-					Err(_e) => {
-						if reconnect >= 5 {
-							break;
-						} else {
-							reconnect += 1;
-						}
-					}
+					Ok(_) => (),
+				}
+				warn!("Reconnections value ({})", reconnections);
+				if reconnections >= 5 {
+					break;
 				}
 				let duration = std::time::Duration::from_secs(20);
 				std::thread::sleep(duration);
 			}
-			Ok(())
+			return Err(ErrorKind::EpicboxReconnectLimit.into());
 		}
 		method => {
 			return Err(ErrorKind::ArgumentError(format!(
