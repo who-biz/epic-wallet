@@ -19,6 +19,8 @@ use crate::libwallet::crypto::{sign_challenge, Hex};
 use crate::libwallet::message::EncryptedMessage;
 use crate::util::secp::key::PublicKey;
 
+//use crate::num;
+
 use crate::libwallet::wallet_lock;
 use crate::libwallet::{
 	address, Address, AddressType, EpicboxAddress, TxProof, DEFAULT_EPICBOX_PORT_443,
@@ -178,12 +180,17 @@ impl EpicboxListenChannel {
 		let cpublisher = publisher.clone();
 		let mask = keychain_mask.lock();
 		let km = mask.clone();
-		let controller = EpicboxController::new(container, cpublisher, wallet, km, *reconnections)
+		let controller = EpicboxController::new(container, cpublisher, wallet, km, reconnections)
 			.expect("Could not init epicbox listener!");
 
 		warn!("Starting epicbox listener for: {}", address);
 
-		subscriber.start(controller)
+		debug!(
+			"Reconnections count in listener::start(): ({})",
+			controller.reconnections
+		);
+
+		return subscriber.start(controller);
 	}
 }
 impl EpicboxChannel {
@@ -302,15 +309,25 @@ where
 	let mut reconnections = 0;
 
 	let handle = spawn(move || {
-		let controller =
-			EpicboxController::new(container, cpublisher, wallet, keychain_mask, reconnections)
-				.expect("Could not init epicbox controller!");
+		let controller = EpicboxController::new(
+			container,
+			cpublisher,
+			wallet,
+			keychain_mask,
+			&mut reconnections,
+		)
+		.expect("Could not init epicbox controller!");
 
 		csubscriber
 			.start(controller)
 			.expect("Could not start epicbox controller!");
 		()
 	});
+
+	debug!(
+		">>> in (start_epicbox): reconnections count ({})",
+		reconnections
+	);
 
 	Ok(Box::new(EpicboxListener {
 		address,
@@ -385,7 +402,7 @@ impl EpicboxSubscriber {
 	}
 }
 
-pub struct EpicboxController<P, L, C, K>
+pub struct EpicboxController<'a, P, L, C, K>
 where
 	P: Publisher,
 	L: WalletLCProvider<'static, C, K> + 'static,
@@ -397,7 +414,7 @@ where
 	pub wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K> + 'static>>>,
 	/// Keychain mask
 	pub keychain_mask: Option<SecretKey>,
-	pub reconnections: u32,
+	pub reconnections: &'a mut u32,
 }
 pub struct Container {
 	pub config: EpicboxConfig,
@@ -441,7 +458,7 @@ impl fmt::Display for ListenerInterface {
 	}
 }
 
-impl<P, L, C, K> EpicboxController<P, L, C, K>
+impl<'a, P, L, C, K> EpicboxController<'a, P, L, C, K>
 where
 	P: Publisher,
 	L: WalletLCProvider<'static, C, K> + 'static,
@@ -454,13 +471,13 @@ where
 		publisher: P,
 		wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K> + 'static>>>,
 		keychain_mask: Option<SecretKey>,
-		reconnections: u32,
+		reconnections: &'a mut u32,
 	) -> Result<Self, Error> {
 		Ok(Self {
 			publisher,
 			wallet,
 			keychain_mask,
-			reconnections,
+			reconnections: reconnections,
 		})
 	}
 
@@ -507,7 +524,7 @@ pub trait SubscriptionHandler: Send {
 	fn on_close(&self, result: CloseReason);
 }
 
-impl<P, L, C, K> SubscriptionHandler for EpicboxController<P, L, C, K>
+impl<'a, P, L, C, K> SubscriptionHandler for EpicboxController<'a, P, L, C, K>
 where
 	P: Publisher,
 	L: WalletLCProvider<'static, C, K> + 'static,
@@ -644,7 +661,6 @@ impl EpicboxBroker {
 		let handler = Arc::new(Mutex::new(handler));
 		let sender = self.inner.clone();
 		let mut first_run = true;
-		//handler.reconnections = Cell::new(0);
 
 		// time interval for sleep in main loop
 		let duration = std::time::Duration::from_secs(DEFAULT_INTERVAL);
@@ -675,7 +691,7 @@ impl EpicboxBroker {
 
 			match err {
 				Err(e) => {
-					handler.lock().reconnections += 1;
+					*handler.lock().reconnections += 1;
 					error!(
 						"Error reading message {:?}, Reconnect counter ({})",
 						e,
@@ -701,7 +717,7 @@ impl EpicboxBroker {
 									return Ok(());
 								}
 							};
-						handler.lock().reconnections = 0;
+						*handler.lock().reconnections = 0;
 						debug!(
 							"Connection successful, reconnect counter ({})",
 							handler.lock().reconnections
@@ -829,7 +845,7 @@ impl EpicboxBroker {
 	}
 }
 
-struct EpicboxClient<P, L, C, K>
+struct EpicboxClient<'a, P, L, C, K>
 where
 	L: WalletLCProvider<'static, C, K> + 'static,
 	C: NodeClient + 'static,
@@ -837,7 +853,7 @@ where
 	P: Publisher,
 {
 	sender: Arc<Mutex<WebSocket<MaybeTlsStream<TcpStream>>>>,
-	handler: Arc<Mutex<EpicboxController<P, L, C, K>>>,
+	handler: Arc<Mutex<EpicboxController<'a, P, L, C, K>>>,
 	challenge: Option<String>,
 	address: EpicboxAddress,
 	secret_key: SecretKey,
@@ -845,7 +861,7 @@ where
 }
 
 /// client with handler from ws package
-impl<P, L, C, K> EpicboxClient<P, L, C, K>
+impl<'a, P, L, C, K> EpicboxClient<'a, P, L, C, K>
 where
 	P: Publisher,
 	L: WalletLCProvider<'static, C, K> + 'static,
