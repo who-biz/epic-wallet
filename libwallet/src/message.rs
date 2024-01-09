@@ -18,7 +18,7 @@ use ring::rand::{self, SecureRandom};
 
 use std::convert::TryInto;
 
-struct CounterNonceSequence(u64);
+struct CounterNonceSequence(u32);
 
 impl NonceSequence for CounterNonceSequence {
 	// called once for each seal operation
@@ -60,9 +60,9 @@ impl EncryptedMessage {
 		let rng = rand::SystemRandom::new();
 		let mut salt: [u8; 8] = [0; 8];
 		rng.fill(&mut salt)?;
-		let mut nonce_bytes: [u8; 8] = [0; 8];
+		let mut nonce_bytes: [u8; 4] = [0; 4];
 		rng.fill(&mut nonce_bytes)?;
-		let counter_val = u64::from_be_bytes(nonce_bytes);
+		let counter_val = u32::from_be_bytes(nonce_bytes);
 		warn!("Counter val in encryption: {}", counter_val);
 		//let nonce_val = thread_rng().gen::<[u8; 12]>();
 		let nonce_sequence = CounterNonceSequence(counter_val);
@@ -130,8 +130,8 @@ impl EncryptedMessage {
 
 		let unbound_key =
 			aead::UnboundKey::new(&aead::CHACHA20_POLY1305, key).map_err(|_| Error::Decryption)?;
-		let counter_bytes: [u8; 8] = counter_vec.try_into().unwrap();
-		let counter_val = u64::from_be_bytes(counter_bytes);
+		let counter_bytes: [u8; 4] = counter_vec.try_into().unwrap();
+		let counter_val = u32::from_be_bytes(counter_bytes);
 		warn!("CounterVal in decryption = {}", counter_val);
 		let mut opening_key = aead::OpeningKey::new(unbound_key, CounterNonceSequence(counter_val));
 
