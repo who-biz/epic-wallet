@@ -18,6 +18,7 @@ use crate::epic_core::core::{committed, transaction};
 
 use crate::epic_keychain;
 use crate::epic_util::secp;
+use ring::error::Unspecified;
 use std::io;
 /// Error definition
 
@@ -285,6 +286,9 @@ pub enum Error {
 
 	#[error("NotFoundErr Error: {}", _0)]
 	NotFoundErr(String),
+
+	#[error("Ring Error: Unspecified ({})", 0)]
+	Unspecified(String),
 }
 
 impl From<io::Error> for Error {
@@ -330,5 +334,11 @@ impl From<crate::epic_core::libtx::Error> for Error {
 impl From<committed::Error> for Error {
 	fn from(error: committed::Error) -> Error {
 		Error::Committed(error)
+	}
+}
+
+impl From<Unspecified> for Error {
+	fn from(error: Unspecified) -> Error {
+		Error::Unspecified(error.to_string())
 	}
 }
