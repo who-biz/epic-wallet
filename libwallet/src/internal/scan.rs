@@ -80,6 +80,7 @@ where
 
 	for output in outputs.iter() {
 		let (commit, proof, is_coinbase, height, mmr_index) = output;
+                //warn!("commit({:?}), proof({:?}), height({:?}), mmr_index({:?})", commit, proof, height, mmr_index);
 		// attempt to unwind message from the RP and get a value
 		// will fail if it's not ours
 		let info = {
@@ -95,7 +96,7 @@ where
 		};
 
 		let (amount, key_id, switch) = match info {
-			Some(i) => i,
+			Some(i) => { warn!("info({:?})", i); i },
 			None => {
 				continue;
 			}
@@ -155,12 +156,15 @@ where
 	C: NodeClient + 'a,
 	K: Keychain + 'a,
 {
-	let batch_size = 1000;
+	let batch_size = 100;
 	let start_index_stat = start_index;
 	let mut start_index = start_index;
 	let mut result_vec: Vec<OutputResult> = vec![];
 	let last_retrieved_return_index;
+        let mut iters = 0;
 	loop {
+                iters += 1;
+                warn!("loop iters({:?})", iters);
 		let (highest_index, last_retrieved_index, outputs) =
 			client.get_outputs_by_pmmr_index(start_index, end_index, batch_size)?;
 
@@ -179,20 +183,19 @@ where
 			let _ = s.send(StatusMessage::Scanning(msg, perc_complete));
 		}
 
-		result_vec.append(&mut identify_utxo_outputs(
-			keychain,
-			outputs.clone(),
-			status_send_channel,
-			perc_complete as u8,
-		)?);
+                let mut utxo_outputs = identify_utxo_outputs(keychain, outputs.clone(), status_send_channel, perc_complete as u8).unwrap();
+                warn!("utxo_outputs = {:?}", utxo_outputs.clone());
+		result_vec.append(&mut utxo_outputs);
 
 		if highest_index <= last_retrieved_index {
+                        warn!("highest_index condition hit!");
 			last_retrieved_return_index = last_retrieved_index;
 			break;
 		}
 		start_index = last_retrieved_index + 1;
 	}
-	Ok((result_vec, last_retrieved_return_index))
+        warn!("result_vec({:?})", result_vec.clone());
+	return Ok((result_vec, last_retrieved_return_index))
 }
 
 ///
@@ -361,7 +364,7 @@ where
 		pmmr_range.0,
 		Some(pmmr_range.1),
 		status_send_channel,
-	)?;
+	).unwrap();
 	let msg = format!(
 		"Identified {} wallet_outputs as belonging to this wallet",
 		chain_outs.len(),
@@ -386,7 +389,7 @@ where
 			None,
 			None,
 			None,
-		)?
+		).unwrap()
 	};
 
 	let mut missing_outs = vec![];
