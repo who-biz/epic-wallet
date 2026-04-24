@@ -84,6 +84,12 @@ pub enum ProtocolRequestV2 {
 		wallet_mode: String,
 		protocol_version: String,
 	},
+	CancelTransaction {
+		slate_id: String,
+		address: String,
+		signature: String,
+                ver: String,
+	}
 }
 
 impl Display for ProtocolRequest {
@@ -139,6 +145,16 @@ impl Display for ProtocolRequestV2 {
 				f,
 				"Wallet Version {}, Wallet Mode {}, Protocol Version {}",
 				wallet_version, wallet_mode, protocol_version
+			),
+			ProtocolRequestV2::CancelTransaction {
+				ref slate_id,
+				ref address,
+				signature: _,
+				ver: _,
+			} => write!(
+				f,
+				"Sending request to cancel slate {}, to epicbox at {}",
+				slate_id, address
 			),
 		}
 	}
