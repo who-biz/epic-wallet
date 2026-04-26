@@ -150,7 +150,6 @@ impl Display for ProtocolRequestV2 {
 				ref slate_id,
 				ref address,
 				signature: _,
-				ver: _,
 			} => write!(
 				f,
 				"Sending request to cancel slate {}, to epicbox at {}",
@@ -201,6 +200,9 @@ pub enum ProtocolResponseV2 {
 	GetVersion {
 		str: String,
 	},
+	TransactionCancelled {
+		slate_id: String,	
+	},
 }
 
 impl Display for ProtocolResponse {
@@ -238,7 +240,9 @@ impl Display for ProtocolResponseV2 {
 			ProtocolResponseV2::GetVersion { ref str } => {
 				write!(f, "{} {}", "Version", str)
 			}
-
+			ProtocolResponseV2::TransactionCancelled { ref slate_id } => {
+				write!(f, "tx with slate_id {} cancelled", slate_id)
+			}
 			ProtocolResponseV2::Slate {
 				ref from,
 				str: _,
