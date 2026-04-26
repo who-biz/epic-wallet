@@ -504,33 +504,22 @@ where
 		slate_id: &str,
 	) -> Result<(), Error> {
 		info!("Processing transaction cancellation for slate_id {}", slate_id);
-
-		let uuid = match uuid::Uuid::parse_str(slate_id) {
-			Ok(u) => u,
-			Err(e) => {
-				return Err(Error::GenericError(format!(
-					"Invalid slate_id format: {} ({})",
-					slate_id, e
-				)));
-			}
-		};
-
 		{
 			wallet_lock!(self.wallet, w);
-			match owner::cancel_tx(
+			match owner::cancel_tx_stateless(
 				&mut **w,
 				self.keychain_mask.as_ref(),
-				None,          // tx_id (unused)
-				Some(uuid),    // slate_id
+				&slate_id.to_string(),
 			) {
 				Ok(_) => {
 					info!("Transaction [{}] marked as cancelled", slate_id);
 				}
 				Err(e) => {
-					return Err(Error::GenericError(format!(
-						"Failed to cancel tx {}: {:?}",
+					// non-fatal, tolerate race (maybe for now? maybe change, we'll see)
+					warn!(
+						"Cancel tx [{}] failed (may already be finalized/cancelled): {:?}",
 						slate_id, e
-					)));
+					);
 				}
 			}
 		}
@@ -694,7 +683,7 @@ where
 		}
 	}
 
-	fn on_tx_cancelled(&self, slate_id: &str) {
+	fn on_tx_cancelled(&self, slate_id: &String) {
 		warn!("Transaction cancelled for slate_id {}", slate_id);
 
 		match self.process_tx_cancelled(slate_id) {

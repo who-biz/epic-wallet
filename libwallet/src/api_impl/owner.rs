@@ -661,6 +661,48 @@ where
     Ok(sl)
 }
 
+/// Cancels a tx (for use with epicbox, does not have internal lock)
+pub fn cancel_tx_stateless<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	slate_id: &String,
+) -> Result<(), Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let uuid = match uuid::Uuid::parse_str(slate_id) {
+		Ok(u) => u,
+		Err(e) => {
+			return Err(Error::GenericError(format!(
+				"Invalid slate_id format: {} ({})",
+				slate_id, e
+			)));
+		}
+	};
+	let parent_key_id = w.parent_key_id();
+	match tx::cancel_tx(
+		&mut *w,
+		keychain_mask,
+		&parent_key_id,
+		None,
+		Some(uuid),
+	) {
+		Ok(_) => {
+			info!("Transaction [{}] marked as cancelled", slate_id);
+		}
+		Err(e) => {
+                        // non-fatal
+			warn!(
+				"Cancel tx [{}] failed (may already be finalized/cancelled): {:?}",
+				slate_id, e
+			);
+		}
+	}
+	Ok(())
+}
+
 /// Wrapper for tx::update_mempool_status
 pub fn update_mempool_status<'a, T: ?Sized, C, K>(
     wallet: &mut T,

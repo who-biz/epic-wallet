@@ -88,7 +88,6 @@ pub enum ProtocolRequestV2 {
 		slate_id: String,
 		address: String,
 		signature: String,
-                ver: String,
 	}
 }
 
