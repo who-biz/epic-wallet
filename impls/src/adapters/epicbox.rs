@@ -499,6 +499,44 @@ where
 		})
 	}
 
+	fn process_tx_cancelled(
+		&self,
+		slate_id: &str,
+	) -> Result<(), Error> {
+		info!("Processing transaction cancellation for slate_id {}", slate_id);
+
+		let uuid = match uuid::Uuid::parse_str(slate_id) {
+			Ok(u) => u,
+			Err(e) => {
+				return Err(Error::GenericError(format!(
+					"Invalid slate_id format: {} ({})",
+					slate_id, e
+				)));
+			}
+		};
+
+		{
+			wallet_lock!(self.wallet, w);
+			match owner::cancel_tx(
+				&mut **w,
+				self.keychain_mask.as_ref(),
+				None,          // tx_id (unused)
+				Some(uuid),    // slate_id
+			) {
+				Ok(_) => {
+					info!("Transaction [{}] marked as cancelled", slate_id);
+				}
+				Err(e) => {
+					return Err(Error::GenericError(format!(
+						"Failed to cancel tx {}: {:?}",
+						slate_id, e
+					)));
+				}
+			}
+		}
+		Ok(())
+	}
+
 	fn process_incoming_slate(
 		&self,
 		address: Option<String>,
@@ -594,6 +632,7 @@ where
 }
 pub trait SubscriptionHandler: Send {
 	fn on_slate(&self, from: &EpicboxAddress, slate: &VersionedSlate, proof: Option<&mut TxProof>);
+        fn on_tx_cancelled(&self, slate_id: &String);
 	fn on_close(&self, result: CloseReason);
 }
 
@@ -652,6 +691,15 @@ where
 		match result {
 			Ok(()) => {}
 			Err(e) => error!("Error process incoming slate. {:?}", e),
+		}
+	}
+
+	fn on_tx_cancelled(&self, slate_id: &str) {
+		warn!("Transaction cancelled for slate_id {}", slate_id);
+
+		match self.process_tx_cancelled(slate_id) {
+			Ok(()) => {}
+			Err(e) => error!("Error handling tx cancellation [{}]: {:?}", slate_id, e),
 		}
 	}
 
@@ -874,6 +922,28 @@ impl EpicboxBroker {
 										);
 									}
 								};
+							}
+							ProtocolResponseV2::TransactionCancelled { slate_id } => {
+								warn!("Transaction cancelled for slate_id {}", slate_id);
+
+								client.handler.lock().on_tx_cancelled(&slate_id);
+
+								let signature = sign_challenge(
+									&client.challenge.clone().unwrap(),
+									&secret_key,
+								)?
+								.to_hex();
+
+								//TODO: do we need this? we re-subscribe when we handle slates typically
+								let request_sub = ProtocolRequestV2::Subscribe {
+									address: client.address.public_key.to_string(),
+									ver: ver.to_string(),
+									signature,
+								};
+
+								if let Err(e) = client.send(&request_sub) {
+									error!("Could not send subscribe request after cancellation: {}", e);
+								}
 							}
 							ProtocolResponseV2::GetVersion { str } => {
 								trace!("ProtocolResponseV2::GetVersion {}", str);
