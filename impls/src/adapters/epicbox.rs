@@ -893,7 +893,7 @@ impl EpicboxBroker {
 									message.to_string()
 								);
 								// bugfix: return Ok() silently killed subscriber
-                                                                // we want to keep reading if we get malformed messages, not quit
+								// we want to keep reading if we get malformed messages, not quit
 								continue;
 								//return Ok(())
 							}
@@ -1130,9 +1130,12 @@ impl EpicboxBroker {
 		from: &EpicboxAddress,
 		secret_key: &SecretKey,
 	) -> Result<(), Error> {
-		// Server precondition: a Subscribe must have completed on this same
-		// connection, else it replies InvalidRequest "Subscribe before
-		// canceltx." Fail fast locally instead of round-tripping.
+                //TODO: (Biz) do we need this? can't we just handle this and tolerate the
+                // Invalid request?
+
+		// server requires that a subscribe must have completed on this same
+		// connection, else it replies InvalidRequest. Fail fast locally instead of
+                // round-tripping.
 		if !self.subscribed.load(std::sync::atomic::Ordering::SeqCst) {
 			return Err(Error::EpicboxTungstenite(
 				"CancelTx requires an active epicbox subscription on this connection"

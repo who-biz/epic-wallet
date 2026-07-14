@@ -207,7 +207,7 @@ pub enum ProtocolResponseV2 {
 	/// the cancel_tx_stateless() locally. Response of plain Ok from
 	/// CancelTx is intentionally ambiguous to combat probing (unknown id
 	/// or requester not a participant). cancel_tx_stateless() should not be
-        /// called on Ok return.
+	/// called on a plain Ok return, as a result.
 	TransactionCancelled {
 		epicboxmsgid: String,
 	},
