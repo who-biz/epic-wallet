@@ -84,11 +84,11 @@ pub enum ProtocolRequestV2 {
 		wallet_mode: String,
 		protocol_version: String,
 	},
-	CancelTransaction {
-		slate_id: String,
+	CancelTx {
 		address: String,
+		epicboxmsgid: String,
 		signature: String,
-	}
+	},
 }
 
 impl Display for ProtocolRequest {
@@ -145,14 +145,14 @@ impl Display for ProtocolRequestV2 {
 				"Wallet Version {}, Wallet Mode {}, Protocol Version {}",
 				wallet_version, wallet_mode, protocol_version
 			),
-			ProtocolRequestV2::CancelTransaction {
-				ref slate_id,
+			ProtocolRequestV2::CancelTx {
+				ref epicboxmsgid,
 				ref address,
 				signature: _,
 			} => write!(
 				f,
-				"Sending request to cancel slate {}, to epicbox at {}",
-				slate_id, address
+				"CancelTx for epicboxmsgid {}, as {}",
+				epicboxmsgid, address
 			),
 		}
 	}
@@ -180,7 +180,10 @@ pub enum ProtocolResponse {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum ProtocolResponseV2 {
-	Ok,
+	Ok {
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		epicboxmsgid: Option<String>,
+	},
 	Error {
 		kind: ProtocolError,
 		description: String,
@@ -199,8 +202,14 @@ pub enum ProtocolResponseV2 {
 	GetVersion {
 		str: String,
 	},
+	/// Positive confirmation that the relay deleted the queued slate for
+	/// this epicboxmsgid. This is the only response that should trigger
+	/// the cancel_tx_stateless() locally. Response of plain Ok from
+	/// CancelTx is intentionally ambiguous to combat probing (unknown id
+	/// or requester not a participant). cancel_tx_stateless() should not be
+        /// called on Ok return.
 	TransactionCancelled {
-		slate_id: String,	
+		epicboxmsgid: String,
 	},
 }
 
@@ -228,7 +237,10 @@ impl Display for ProtocolResponse {
 impl Display for ProtocolResponseV2 {
 	fn fmt(&self, f: &mut Formatter) -> Result {
 		match *self {
-			ProtocolResponseV2::Ok => write!(f, "{}", "Ok"),
+			ProtocolResponseV2::Ok { ref epicboxmsgid } => match epicboxmsgid {
+				Some(id) => write!(f, "Ok (epicboxmsgid {})", id),
+				None => write!(f, "Ok"),
+			},
 			ProtocolResponseV2::Error {
 				ref kind,
 				description: _,
@@ -239,8 +251,8 @@ impl Display for ProtocolResponseV2 {
 			ProtocolResponseV2::GetVersion { ref str } => {
 				write!(f, "{} {}", "Version", str)
 			}
-			ProtocolResponseV2::TransactionCancelled { ref slate_id } => {
-				write!(f, "tx with slate_id {} cancelled", slate_id)
+			ProtocolResponseV2::TransactionCancelled { ref epicboxmsgid } => {
+				write!(f, "tx with epicboxmsgid {} cancelled on relay", epicboxmsgid)
 			}
 			ProtocolResponseV2::Slate {
 				ref from,

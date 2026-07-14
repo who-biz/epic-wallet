@@ -56,6 +56,10 @@ use tungstenite::connect;
 use tungstenite::Error as tungsteniteError;
 use tungstenite::{protocol::WebSocket, stream::MaybeTlsStream};
 use tungstenite::{Error as ErrorTungstenite, Message};
+
+// Do we actually need this? Used only for new postslate response
+use uuid::Uuid;
+
 // Copyright 2019 The vault713 Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -232,7 +236,10 @@ impl EpicboxChannel {
 
 		let container = Container::new(config.clone());
 
-		let (tx, _rx): (Sender<bool>, Receiver<bool>) = channel();
+		// read loop signals our PostSlate has been received && persisted via
+		// set_tx_epicbox_msg_id. Without waiting (on rx), the old flow tore the
+		// socket down before the ack arrived and the msgid was lost forever
+		let (tx, rx): (Sender<bool>, Receiver<bool>) = channel();
 		let listener = start_epicbox(
 			container.clone(),
 			wallet,
@@ -258,6 +265,26 @@ impl EpicboxChannel {
 			Ok(_) => (),
 			Err(e) => return Err(e),
 		};
+
+		// start wait for relay acknowledgment (needs reviewed, should be reasonably async)
+		if rx
+			.recv_timeout(std::time::Duration::from_secs(30))
+			.is_err()
+		{
+			warn!(
+				"No relay ack for posted slate within 30s; epicboxmsgid not \
+				 stored, tx will not be relay-cancellable"
+			);
+		}
+
+		if let Some(l) = container
+			.lock()
+			.listeners
+			.remove(&ListenerInterface::Epicbox)
+		{
+			let _ = l.stop();
+		}
+		// end wait
 
 		let slate: Slate = VersionedSlate::into_version(slate.clone(), SlateVersion::V2).into();
 		Ok(slate)
@@ -358,7 +385,17 @@ impl Listener for EpicboxListener {
 	/// post slate
 	fn publish(&self, slate: &VersionedSlate, to: &String) -> Result<(), Error> {
 		let address = EpicboxAddress::from_str(to)?;
-		self.publisher.post_slate(slate, &address, true)
+		// was post_slate(.., true), which closed the socket before the relay's
+		// response could be read & the msgid was never persisted. subscriber must
+                // remain open to receive it. teardown now happens in send()
+		self.publisher.post_slate(slate, &address, false)
+	}
+
+	// expose relay-cancel to the command layer.
+	/// Request deletion of a queued slate on the relay by epicboxmsgid.
+	/// Local cancel happens only when TransactionCancelled comes back.
+	fn cancel(&self, epicboxmsgid: &String) -> Result<(), Error> {
+		self.publisher.cancel_tx(epicboxmsgid)
 	}
 
 	/// stops wss connection
@@ -400,6 +437,11 @@ impl Publisher for EpicboxPublisher {
 			self.broker.stop().unwrap();
 		}
 		Ok(())
+	}
+
+	fn cancel_tx(&self, epicboxmsgid: &String) -> Result<(), Error> {
+		self.broker
+			.post_cancel_tx(epicboxmsgid, &self.address, &self.secret_key)
 	}
 }
 impl EpicboxSubscriber {
@@ -459,6 +501,7 @@ pub trait Listener: Send + 'static {
 	fn interface(&self) -> ListenerInterface;
 	fn address(&self) -> String;
 	fn publish(&self, slate: &VersionedSlate, to: &String) -> Result<(), Error>;
+	fn cancel(&self, epicboxmsgid: &String) -> Result<(), Error>;
 	fn stop(self: Box<Self>) -> Result<(), Error>;
 }
 
@@ -499,28 +542,25 @@ where
 		})
 	}
 
-	fn process_tx_cancelled(
-		&self,
-		slate_id: &str,
-	) -> Result<(), Error> {
-		info!("Processing transaction cancellation for slate_id {}", slate_id);
-		{
-			wallet_lock!(self.wallet, w);
-			match owner::cancel_tx_stateless(
-				&mut **w,
-				self.keychain_mask.as_ref(),
-				&slate_id.to_string(),
-			) {
-				Ok(_) => {
-					info!("Transaction [{}] marked as cancelled", slate_id);
-				}
-				Err(e) => {
-					// non-fatal, tolerate race (maybe for now? maybe change, we'll see)
-					warn!(
-						"Cancel tx [{}] failed (may already be finalized/cancelled): {:?}",
-						slate_id, e
-					);
-				}
+	fn process_tx_cancelled(&self, epicboxmsgid: &str) -> Result<(), Error> {
+		info!(
+			"Processing relay-confirmed cancellation, epicboxmsgid {}",
+			epicboxmsgid
+		);
+		match owner::cancel_tx_stateless(
+			self.wallet.clone(),
+			self.keychain_mask.as_ref(),
+			&epicboxmsgid.to_string(),
+			None, // relay-confirmed path, never fall back to slateID
+		) {
+			Ok(_) => {
+				info!("Tx for epicboxmsgid [{}] marked as cancelled", epicboxmsgid);
+			}
+			Err(e) => {
+				warn!(
+					"Local cancel for epicboxmsgid [{}] failed (may already be finalized/cancelled): {:?}",
+					epicboxmsgid, e
+				);
 			}
 		}
 		Ok(())
@@ -621,7 +661,8 @@ where
 }
 pub trait SubscriptionHandler: Send {
 	fn on_slate(&self, from: &EpicboxAddress, slate: &VersionedSlate, proof: Option<&mut TxProof>);
-        fn on_tx_cancelled(&self, slate_id: &String);
+	fn on_post_slate_ack(&self, tx_slate_id: &Uuid, epicboxmsgid: &String);
+	fn on_tx_cancelled(&self, epicboxmsgid: &String);
 	fn on_close(&self, result: CloseReason);
 }
 
@@ -683,12 +724,34 @@ where
 		}
 	}
 
-	fn on_tx_cancelled(&self, slate_id: &String) {
-		warn!("Transaction cancelled for slate_id {}", slate_id);
+	// persist the relay msgid against the posted slate's tx log entry
+	fn on_post_slate_ack(&self, tx_slate_id: &Uuid, epicboxmsgid: &String) {
+		match owner::set_tx_epicbox_msg_id(
+			self.wallet.clone(),
+			self.keychain_mask.as_ref(),
+			tx_slate_id,
+			epicboxmsgid,
+		) {
+			Ok(_) => info!(
+				"Stored epicboxmsgid [{}] for slate [{}]",
+				epicboxmsgid, tx_slate_id
+			),
+			Err(e) => warn!(
+				"Could not store epicboxmsgid [{}] for slate [{}]: {:?}",
+				epicboxmsgid, tx_slate_id, e
+			),
+		}
+	}
 
-		match self.process_tx_cancelled(slate_id) {
+	fn on_tx_cancelled(&self, epicboxmsgid: &String) {
+		warn!("Relay cancelled tx for epicboxmsgid {}", epicboxmsgid);
+
+		match self.process_tx_cancelled(epicboxmsgid) {
 			Ok(()) => {}
-			Err(e) => error!("Error handling tx cancellation [{}]: {:?}", slate_id, e),
+			Err(e) => error!(
+				"Error handling tx cancellation [{}]: {:?}",
+				epicboxmsgid, e
+			),
 		}
 	}
 
@@ -733,6 +796,7 @@ pub trait Publisher: Send {
 		to: &EpicboxAddress,
 		close_connection: bool,
 	) -> Result<(), Error>;
+	fn cancel_tx(&self, epicboxmsgid: &String) -> Result<(), Error>;
 }
 
 ///TODO: reduce to broker
@@ -740,6 +804,10 @@ pub trait Publisher: Send {
 pub struct EpicboxBroker {
 	inner: Arc<Mutex<WebSocket<MaybeTlsStream<TcpStream>>>>,
 	tx: Sender<bool>,
+	// cross-thread state for the new cancel_tx mechanics
+	pending_post: Arc<Mutex<Option<Uuid>>>,
+	// guard against subscribe-before-cancel race, to satisfy server requirements
+	subscribed: Arc<AtomicBool>,
 }
 impl EpicboxBroker {
 	/// Create a EpicboxBroker,
@@ -751,6 +819,8 @@ impl EpicboxBroker {
 		Ok(Self {
 			inner: Arc::new(Mutex::new(inner)),
 			tx,
+			pending_post: Arc::new(Mutex::new(None)),
+			subscribed: Arc::new(AtomicBool::new(false)),
 		})
 	}
 
@@ -822,7 +892,10 @@ impl EpicboxBroker {
 									e,
 									message.to_string()
 								);
-								return Ok(());
+								// bugfix: return Ok() silently killed subscriber
+                                                                // we want to keep reading if we get malformed messages, not quit
+								continue;
+								//return Ok(())
 							}
 						};
 
@@ -850,6 +923,9 @@ impl EpicboxBroker {
 								let _ = client.send(&request_sub).map_err(|e| {
 									error!("Error attempting to send Subscribe {:?}", e)
 								});
+								// cancel_tx may now be permitted, since we are subscribed veritably
+								self.subscribed
+									.store(true, std::sync::atomic::Ordering::SeqCst);
 							}
 							ProtocolResponseV2::Slate {
 								from,
@@ -869,7 +945,9 @@ impl EpicboxBroker {
 									Ok(x) => x,
 									Err(e) => {
 										error!("{}", e.to_string());
-										return Ok(());
+										// Same thread killing bug as above, don't return Ok(), continue
+										continue;
+										//return Ok(());
 									}
 								};
 
@@ -912,10 +990,13 @@ impl EpicboxBroker {
 									}
 								};
 							}
-							ProtocolResponseV2::TransactionCancelled { slate_id } => {
-								warn!("Transaction cancelled for slate_id {}", slate_id);
+							ProtocolResponseV2::TransactionCancelled { epicboxmsgid } => {
+								warn!(
+									"Relay confirmed cancellation for epicboxmsgid {}",
+									epicboxmsgid
+								);
 
-								client.handler.lock().on_tx_cancelled(&slate_id);
+								client.handler.lock().on_tx_cancelled(&epicboxmsgid);
 
 								let signature = sign_challenge(
 									&client.challenge.clone().unwrap(),
@@ -951,8 +1032,34 @@ impl EpicboxBroker {
 									error!("ProtocolResponse::Error {}", response);
 								}
 							},
-							ProtocolResponseV2::Ok {} => {
-								debug!("Response Ok.");
+							ProtocolResponseV2::Ok { epicboxmsgid } => {
+								match epicboxmsgid {
+									Some(msgid) => {
+										// persist the relayed ack with the epicbox_msg_id
+										let pending = self.pending_post.lock().take();
+										match pending {
+											Some(slate_id) => {
+												client
+													.handler
+													.lock()
+													.on_post_slate_ack(&slate_id, &msgid);
+												// unblock a send-mode caller
+												// waiting on the ack (E2)
+												let _ = client.tx.send(true);
+											}
+											None => {
+												warn!(
+													"Received epicboxmsgid {} with no pending PostSlate; ignoring",
+													msgid
+												);
+											}
+										}
+									}
+									None => {
+										// never cancel locally on plain Ok
+										debug!("Response Ok.");
+									}
+								}
 							}
 						}
 					}
@@ -1001,6 +1108,9 @@ impl EpicboxBroker {
 		let slate: Slate = slate.into();
 		debug!("Starting to send slate with id [{}]", slate.id.to_string());
 
+		// record slate that is waiting on an ack
+		*self.pending_post.lock() = Some(slate.id);
+
 		self.inner
 			.lock()
 			.send(Message::Text(
@@ -1012,6 +1122,44 @@ impl EpicboxBroker {
 
 		Ok(())
 	}
+
+	// sign epicboxmsgid string, with the address secret key and request cancel
+	fn post_cancel_tx(
+		&self,
+		epicboxmsgid: &String,
+		from: &EpicboxAddress,
+		secret_key: &SecretKey,
+	) -> Result<(), Error> {
+		// Server precondition: a Subscribe must have completed on this same
+		// connection, else it replies InvalidRequest "Subscribe before
+		// canceltx." Fail fast locally instead of round-tripping.
+		if !self.subscribed.load(std::sync::atomic::Ordering::SeqCst) {
+			return Err(Error::EpicboxTungstenite(
+				"CancelTx requires an active epicbox subscription on this connection"
+					.to_string()
+					.into(),
+			));
+		}
+
+		let signature = sign_challenge(epicboxmsgid, secret_key)?.to_hex();
+		let request = ProtocolRequestV2::CancelTx {
+			address: from.public_key.to_string(),
+			epicboxmsgid: epicboxmsgid.clone(),
+			signature,
+		};
+
+		debug!("Sending CancelTx for epicboxmsgid [{}]", epicboxmsgid);
+
+		self.inner
+			.lock()
+			.send(Message::Text(
+				serde_json::to_string(&request).unwrap().into(),
+			))
+			.map_err(|e| {
+				Error::EpicboxTungstenite(format!("Could not send CancelTx: {}", e).into())
+			})
+	}
+
 	fn stop(&self) -> Result<(), tungsteniteError> {
 		self.inner.lock().close(None)
 	}
