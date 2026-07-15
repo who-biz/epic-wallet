@@ -547,7 +547,7 @@ where
 			"Processing relay-confirmed cancellation, epicboxmsgid {}",
 			epicboxmsgid
 		);
-		match owner::cancel_tx_stateless(
+		match owner::cancel_epicbox_tx(
 			self.wallet.clone(),
 			self.keychain_mask.as_ref(),
 			&epicboxmsgid.to_string(),

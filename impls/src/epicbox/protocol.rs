@@ -204,9 +204,9 @@ pub enum ProtocolResponseV2 {
 	},
 	/// Positive confirmation that the relay deleted the queued slate for
 	/// this epicboxmsgid. This is the only response that should trigger
-	/// the cancel_tx_stateless() locally. Response of plain Ok from
+	/// the cancel_epicbox_tx() locally. Response of plain Ok from
 	/// CancelTx is intentionally ambiguous to combat probing (unknown id
-	/// or requester not a participant). cancel_tx_stateless() should not be
+	/// or requester not a participant). cancel_epicbox_tx() should not be
 	/// called on a plain Ok return, as a result.
 	TransactionCancelled {
 		epicboxmsgid: String,

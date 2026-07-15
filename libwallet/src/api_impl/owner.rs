@@ -718,8 +718,10 @@ where
 /// for cases where we disconnected before receivng TransactionCancelled repsonse.
 /// Locks internally. Callers must not hold the lock (e.g. epicbox adapter).
 /// Caller should pass None for fallback_slate_id when strictly relying on epicbox
-/// protocol messages.
-pub fn cancel_tx_stateless<'a, L, C, K>(
+/// protocol messages. This tx cancellation function is largely stateless. It does
+/// not communicate state to epicbox, and epicbox will not passthrough cancels
+/// to other instances. It is a 1-way request to clear a slate from epicbox DB.
+pub fn cancel_epicbox_tx<'a, L, C, K>(
 	wallet_inst: Arc<Mutex<Box<dyn WalletInst<'a, L, C, K>>>>,
 	keychain_mask: Option<&SecretKey>,
 	epicbox_msg_id: &String,
