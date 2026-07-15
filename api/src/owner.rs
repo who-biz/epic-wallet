@@ -1252,6 +1252,76 @@ where
 		)
 	}
 
+        /// Single shot cancel_epicbox_tx attempt via API/CLI command
+	pub fn cancel_tx_epicbox(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		tx_id: Option<u32>,
+		epicbox_msg_id: Option<String>,
+	) -> Result<(), Error> {
+		let msgid = match (epicbox_msg_id, tx_id) {
+			(Some(e), None) => {
+				// epic-wallet cancel -e <epicbox_msg_id> path. checks that epicboxmsgid exists
+                                // before any interaction with networked code
+				let res =
+					self.retrieve_txs(keychain_mask, false, None, None, None, None, None)?;
+				let found = res
+					.txs
+					.iter()
+					.any(|t| t.epicbox_msg_id.as_deref() == Some(e.as_str()));
+				if !found {
+					return Err(Error::GenericError(format!(
+						"No local transaction matches epicbox_msg_id [{}]; nothing to cancel.",
+						e
+					)));
+				}
+				e
+			}
+			(None, Some(id)) => {
+				// epic-wallet cancel -i <x> -m epicbox path. checks that tx at index x exists && 
+                                // has associated epicboxmsgid before any interaction with networked code
+				let res =
+					self.retrieve_txs(keychain_mask, false, Some(id), None, None, None, None)?;
+				let entry = res.txs.into_iter().next().ok_or_else(|| {
+					Error::GenericError(format!("Transaction with id {} not found", id))
+				})?;
+				entry.epicbox_msg_id.ok_or_else(|| {
+					Error::GenericError(format!(
+						"Transaction {} has no stored epicbox message id; it cannot be \
+						 cancelled via the relay. Use the standard cancel for a local cancel.",
+						id
+					))
+				})?
+			}
+			_ => {
+				return Err(Error::GenericError(
+					"Exactly one of tx_id or epicbox_msg_id must be provided".to_owned(),
+				))
+			}
+		};
+
+		let tor_config_lock = self.tor_config.lock();
+		let epicbox_config_lock = self.epicbox_config.lock();
+
+		// dest is unused for cancel. the relay is the epicbox domain from config
+		let epicbox_channel = EpicboxChannel::new(&String::new(), epicbox_config_lock.clone())
+			.map_err(|e| Error::GenericError(format!("{}", e)))?;
+
+		let km = match keychain_mask.as_ref() {
+			None => None,
+			Some(&m) => Some(m.to_owned()),
+		};
+
+		epicbox_channel.cancel(
+			self.wallet_inst.clone(),
+			km,
+			&msgid,
+			self.is_node_synced.clone(),
+			tor_config_lock.clone().unwrap_or_default(),
+		)?;
+		Ok(())
+	}
+
 	/// Retrieves the stored transaction associated with a TxLogEntry. Can be used even after the
 	/// transaction has completed.
 	///

@@ -1258,11 +1258,14 @@ pub struct CancelArgs {
     pub tx_id: Option<u32>,
     pub tx_slate_id: Option<Uuid>,
     pub tx_id_string: String,
+    pub method_is_epicbox: bool,
+    pub epicbox_msg_id: Option<String>,
 }
 
 pub fn cancel<L, C, K>(
     wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K>>>>,
     keychain_mask: Option<&SecretKey>,
+    epicbox_config: Option<EpicboxConfig>,
     args: CancelArgs,
     is_node_synced: Arc<AtomicBool>,
 ) -> Result<(), Error>
@@ -1271,25 +1274,53 @@ where
     C: NodeClient + 'static,
     K: keychain::Keychain + 'static,
 {
-    controller::owner_single_use(
-        wallet.clone(),
-        keychain_mask,
-        |api, m| {
-            let result = api.cancel_tx(m, args.tx_id, args.tx_slate_id);
-            match result {
-                Ok(_) => {
-                    info!("Transaction {} Cancelled", args.tx_id_string);
-                    Ok(())
+    if args.method_is_epicbox {
+        controller::owner_single_use(
+            wallet.clone(),
+            keychain_mask,
+            |api, m| {
+                api.set_epicbox_config(epicbox_config.clone());
+                // If error, nothing was cancelled anywhere the wallet can verify.
+                //TODO: (Biz) handle fallback to local cancel. presently this is invariant
+                // and requires addition retry or a traditional cancel
+                let result = api.cancel_tx_epicbox(m, args.tx_id, args.epicbox_msg_id.clone());
+                match result {
+                    Ok(_) => {
+                        info!(
+                            "Relay confirmed cancellation; local transaction marked as cancelled."
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("Epicbox TX Cancellation failed: {}", e);
+                        Err(e)
+                    }
                 }
-                Err(e) => {
-                    error!("TX Cancellation failed: {}", e);
-                    Err(e)
+            },
+            is_node_synced,
+        )?;
+        Ok(())
+    } else {
+        controller::owner_single_use(
+            wallet.clone(),
+            keychain_mask,
+            |api, m| {
+                let result = api.cancel_tx(m, args.tx_id, args.tx_slate_id);
+                match result {
+                    Ok(_) => {
+                        info!("Transaction {} Cancelled", args.tx_id_string);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("TX Cancellation failed: {}", e);
+                        Err(e)
+                    }
                 }
-            }
-        },
-        is_node_synced,
-    )?;
-    Ok(())
+            },
+            is_node_synced,
+        )?;
+        Ok(())
+    }
 }
 
 /// wallet check

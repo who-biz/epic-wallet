@@ -354,6 +354,14 @@ pub fn build_cli() -> Command {
 				
 				.arg(Arg::new("txid").short('t').long("txid")
 				.help("The TxID UUID of the transaction to cancel").num_args(1))
+
+				.arg(Arg::new("method").short('m').long("method")
+				.help("Cancel method. 'epicbox' requests deletion of the queued slate on the relay; the local tx is cancelled only after the relay confirms. Requires -i (tx must have a stored epicbox message id) or -e.")
+				.value_parser(["epicbox"]).num_args(1))
+
+				.arg(Arg::new("epicbox_msg_id").short('e').long("epicbox_msg_id")
+				.help("The 32-char epicbox message id of the queued slate to cancel. Implies '-m epicbox'.")
+				.num_args(1))
 		)
 		.subcommand(
 			Command::new("info")
@@ -602,6 +610,11 @@ fn parse_required<'a>(args: &'a ArgMatches, name: &str) -> Result<&'a str, Error
             Err(Error::ArgumentError(msg))
         }
     }
+}
+
+//TODO: (Biz) consolidate duplicate code, we have 4 of these i think
+fn is_epicbox_msg_id_arg(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 // parses a number, or throws error with message otherwise
@@ -1214,16 +1227,54 @@ pub fn parse_cancel_args(args: &ArgMatches) -> Result<command::CancelArgs, Error
             }
         },
     };
-    if (tx_id.is_none() && tx_slate_id.is_none()) || (tx_id.is_some() && tx_slate_id.is_some()) {
-        let msg = format!("'id' (-i) or 'txid' (-t) argument is required.");
+
+    // epicbox flags
+    let epicbox_msg_id = match args.get_one::<String>("epicbox_msg_id") {
+        None => None,
+        Some(e) => {
+            if !is_epicbox_msg_id_arg(e) {
+                let msg = format!(
+                    "Invalid epicbox_msg_id '{}': expected exactly 32 alphanumeric characters (the relay message id, not the wallet slate UUID).",
+                    e
+                );
+                return Err(Error::ArgumentError(msg));
+            }
+            Some(e.to_owned())
+        }
+    };
+
+    // -e implies epicbox. explicit -m epicbox alongside -e is tolerated
+    let method_is_epicbox = epicbox_msg_id.is_some()
+        || args.get_one::<String>("method").map(|s| s.as_str()) == Some("epicbox");
+
+    // exactly one selector among -i, -t, -e
+    let selectors = [tx_id.is_some(), tx_slate_id.is_some(), epicbox_msg_id.is_some()]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if selectors != 1 {
+        let msg =
+            format!("Exactly one of 'id' (-i), 'txid' (-t) or 'epicbox_msg_id' (-e) is required.");
         return Err(Error::ArgumentError(msg));
     }
+
+    // relay is msgid addressed. a UUID cannot be sent to it
+    if method_is_epicbox && tx_slate_id.is_some() {
+        let msg = format!(
+            "'-m epicbox' cannot be combined with 'txid' (-t). Use '-i <index>' (the wallet looks up the stored message id) or '-e <epicbox_msg_id>'."
+        );
+        return Err(Error::ArgumentError(msg));
+    }
+
     Ok(command::CancelArgs {
         tx_id,
         tx_slate_id,
         tx_id_string: tx_id_string.to_owned(),
+        method_is_epicbox,
+        epicbox_msg_id,
     })
 }
+
 pub fn parse_export_proof_args(args: &ArgMatches) -> Result<command::ProofExportArgs, Error> {
     let output_file = parse_required(args, "output")?;
     let tx_id = match args.get_one::<String>("id") {
@@ -1644,7 +1695,14 @@ where
         }
         Some(("cancel", args)) => {
             let a = arg_parse!(parse_cancel_args(&args));
-            match command::cancel(wallet, km, a, is_node_synced.clone()) {
+            // epicbox config for the relay path
+            match command::cancel(
+                wallet,
+                km,
+                Some(epicbox_config.clone()),
+                a,
+                is_node_synced.clone(),
+            ) {
                 Ok(_) => Ok("cancel".to_string()),
                 Err(e) => Err(e),
             }

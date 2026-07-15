@@ -289,6 +289,107 @@ impl EpicboxChannel {
 		let slate: Slate = VersionedSlate::into_version(slate.clone(), SlateVersion::V2).into();
 		Ok(slate)
 	}
+        /// One-shot relay cancel: connect, subscribe, send CancelTx, and block
+	/// until TransactionCancelled (subscriber thread has then already run
+	/// owner::cancel_epicbox_tx) or timeout. Returns Ok on relay confirmation.
+	/// Errors if local tx is untouched.
+	pub fn cancel<L, C, K>(
+		&self,
+		wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K> + 'static>>>,
+		keychain_mask: Option<SecretKey>,
+		epicboxmsgid: &String,
+		is_node_synced: Arc<AtomicBool>,
+		tor_config: TorConfig,
+	) -> Result<(), Error>
+	where
+		L: WalletLCProvider<'static, C, K> + 'static,
+		C: NodeClient + 'static,
+		K: Keychain + 'static,
+	{
+		let config = match self.epicbox_config.clone() {
+			None => EpicboxConfig::default(),
+			Some(epicbox_config) => epicbox_config,
+		};
+
+		let container = Container::new(config.clone());
+		let (tx, _rx): (Sender<bool>, Receiver<bool>) = channel();
+
+		let listener = start_epicbox(
+			container.clone(),
+			wallet,
+			keychain_mask,
+			config,
+			tx,
+			is_node_synced,
+			tor_config.clone(),
+		)?;
+		container
+			.lock()
+			.listeners
+			.insert(ListenerInterface::Epicbox, listener);
+
+		let teardown = |container: &Arc<Mutex<Container>>| {
+			if let Some(l) = container
+				.lock()
+				.listeners
+				.remove(&ListenerInterface::Epicbox)
+			{
+				let _ = l.stop();
+			}
+		};
+
+		// post_cancel_tx fails fast until Challenge > Subscribe completes
+		//TODO: (Biz) do we need these retries?
+		let mut sent = false;
+		for _ in 0..20 {
+			let res = container
+				.lock()
+				.listener(ListenerInterface::Epicbox)?
+				.cancel(epicboxmsgid);
+			if res.is_ok() {
+				sent = true;
+				break;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(500));
+		}
+		if !sent {
+			teardown(&container);
+			return Err(Error::EpicboxTungstenite(
+				"Could not send CancelTx: epicbox subscription did not establish"
+					.to_string()
+					.into(),
+			));
+		}
+
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+		let mut confirmed = false;
+		while std::time::Instant::now() < deadline {
+			let ok = container
+				.lock()
+				.listener(ListenerInterface::Epicbox)?
+				.cancel_confirmed(epicboxmsgid);
+			if ok {
+				confirmed = true;
+				break;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(250));
+		}
+
+		teardown(&container);
+
+		if confirmed {
+			Ok(())
+		} else {
+			Err(Error::EpicboxTungstenite(
+				format!(
+					"No TransactionCancelled from relay for [{}] within 30s; \
+					 relay state unknown, local tx untouched.",
+					epicboxmsgid
+				)
+				.into(),
+			))
+		}
+	}
 }
 
 pub fn start_epicbox<L, C, K>(
@@ -398,6 +499,10 @@ impl Listener for EpicboxListener {
 		self.publisher.cancel_tx(epicboxmsgid)
 	}
 
+	fn cancel_confirmed(&self, epicboxmsgid: &str) -> bool {
+		self.publisher.broker.cancel_confirmed.lock().as_deref() == Some(epicboxmsgid)
+	}
+
 	/// stops wss connection
 	fn stop(self: Box<Self>) -> Result<(), Error> {
 		let s = *self;
@@ -502,6 +607,8 @@ pub trait Listener: Send + 'static {
 	fn address(&self) -> String;
 	fn publish(&self, slate: &VersionedSlate, to: &String) -> Result<(), Error>;
 	fn cancel(&self, epicboxmsgid: &String) -> Result<(), Error>;
+        // true once relay confrms cancellation of given msgid
+	fn cancel_confirmed(&self, epicboxmsgid: &str) -> bool;
 	fn stop(self: Box<Self>) -> Result<(), Error>;
 }
 
@@ -808,12 +915,15 @@ pub struct EpicboxBroker {
 	pending_post: Arc<Mutex<Option<Uuid>>>,
 	// guard against subscribe-before-cancel race, to satisfy server requirements
 	subscribed: Arc<AtomicBool>,
+	//TODO: (Biz) remove this mutex, if we can. Probablt requires replacing Sender<bool>
+	// with an event enum BrokerEvent or similar
+	cancel_confirmed: Arc<Mutex<Option<String>>>,
 }
+
 impl EpicboxBroker {
 	/// Create a EpicboxBroker,
 	pub fn new(
 		inner: WebSocket<MaybeTlsStream<TcpStream>>,
-
 		tx: Sender<bool>,
 	) -> Result<Self, Error> {
 		Ok(Self {
@@ -821,6 +931,7 @@ impl EpicboxBroker {
 			tx,
 			pending_post: Arc::new(Mutex::new(None)),
 			subscribed: Arc::new(AtomicBool::new(false)),
+			cancel_confirmed: Arc::new(Mutex::new(None)),
 		})
 	}
 
@@ -997,6 +1108,8 @@ impl EpicboxBroker {
 								);
 
 								client.handler.lock().on_tx_cancelled(&epicboxmsgid);
+								// set mutex indicating we have heard back from server
+								*self.cancel_confirmed.lock() = Some(epicboxmsgid.clone());
 
 								let signature = sign_challenge(
 									&client.challenge.clone().unwrap(),

@@ -732,6 +732,15 @@ where
 	C: NodeClient + 'a,
 	K: Keychain + 'a,
 {
+	if fallback_slate_id.is_some() {
+		debug_assert!(
+			false,
+			"cancel_epicbox_tx fallback_slate_id is reserved for a future \
+			 feature and must be None from current callers"
+		);
+		warn!("cancel_epicbox_tx called with fallback_slate_id=Some(..); not yet supported policy");
+	}
+
 	if !is_epicbox_msg_id(epicbox_msg_id) {
 		return Err(Error::GenericError(format!(
 			"Invalid epicboxmsgid (expected 32 alphanumeric chars): {}",
@@ -749,8 +758,6 @@ where
 		.collect();
 
 	if targets.is_empty() {
-                //TODO: this arm needs some work & testing. do we just exclude this from the 
-                // function and fallback manually in wallets?
 		return match fallback_slate_id {
 			Some(uuid) => {
 				warn!(
