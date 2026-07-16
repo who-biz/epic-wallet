@@ -51,6 +51,7 @@ use std::string::ToString;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::spawn;
+use std::time::Duration;
 
 use tungstenite::connect;
 use tungstenite::Error as tungsteniteError;
@@ -79,10 +80,27 @@ const CONNECTION_ERR_MSG: &str = "\nCan't connect to the epicbox server!\n\
 
 const EPICBOX_PROTOCOL_VERSION: &str = "3.0.0";
 
+const SUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+const RELAY_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Epicbox 'plugin' implementation
 pub enum CloseReason {
 	Normal,
 	Abnormal(Error),
+}
+
+#[derive(Debug, Clone)]
+pub enum BrokerEvent {
+	Subscribed,
+	PostAck {
+		slate_id: Uuid,
+		epicboxmsgid: String,
+	},
+	Made,
+	Cancelled {
+		epicboxmsgid: String,
+	},
 }
 
 #[derive(Clone)]
@@ -172,7 +190,7 @@ impl EpicboxListenChannel {
 				),
 			}
 		};
-		let (tx, _rx): (Sender<bool>, Receiver<bool>) = channel();
+		let (tx, _rx): (Sender<BrokerEvent>, Receiver<BrokerEvent>) = channel();
 
 		debug!("Connecting to the epicbox server at {} ..", url.clone());
 		let (socket, _response) = connect(url.clone()).map_err(|e| {
@@ -204,6 +222,37 @@ impl EpicboxListenChannel {
 		subscriber.start(controller)
 	}
 }
+
+/// Remove and stop the one-shot epicbox listener session, if present.
+/// Closes the websocket and joins the subscriber thread.
+fn stop_epicbox_listener(container: &Arc<Mutex<Container>>) {
+	if let Some(l) = container
+		.lock()
+		.listeners
+		.remove(&ListenerInterface::Epicbox)
+	{
+		let _ = l.stop();
+	}
+}
+
+fn wait_for<F: FnMut(&BrokerEvent) -> bool>( 
+	rx: &Receiver<BrokerEvent>,
+	deadline: std::time::Instant,
+	mut want: F,
+) -> bool {
+	loop {
+		let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+		if remaining.is_zero() {
+			return false;
+		}
+		match rx.recv_timeout(remaining) {
+			Ok(ev) if want(&ev) => return true,
+			Ok(_) => continue,
+			Err(_) => return false, // timeout or subscriber thread gone
+		}
+	}
+}
+
 impl EpicboxChannel {
 	/// new epicbox.
 	pub fn new(
@@ -239,7 +288,7 @@ impl EpicboxChannel {
 		// read loop signals our PostSlate has been received && persisted via
 		// set_tx_epicbox_msg_id. Without waiting (on rx), the old flow tore the
 		// socket down before the ack arrived and the msgid was lost forever
-		let (tx, rx): (Sender<bool>, Receiver<bool>) = channel();
+		let (tx, rx): (Sender<BrokerEvent>, Receiver<BrokerEvent>) = channel();
 		let listener = start_epicbox(
 			container.clone(),
 			wallet,
@@ -257,38 +306,32 @@ impl EpicboxChannel {
 
 		let vslate = VersionedSlate::into_version(slate.clone(), SlateVersion::V2);
 
-		let _ = match container
+		if let Err(e) = container
 			.lock()
 			.listener(ListenerInterface::Epicbox)?
 			.publish(&vslate, &self.dest)
 		{
-			Ok(_) => (),
-			Err(e) => return Err(e),
-		};
+			stop_epicbox_listener(&container);
+			return Err(e);
+		}
 
-		// start wait for relay acknowledgment (needs reviewed, should be reasonably async)
-		if rx
-			.recv_timeout(std::time::Duration::from_secs(30))
-			.is_err()
-		{
+		let ack_deadline = std::time::Instant::now() + RELAY_ACK_TIMEOUT;
+		if !wait_for(&rx, ack_deadline, |ev| {
+			matches!(ev, BrokerEvent::PostAck { .. })
+		}) {
 			warn!(
-				"No relay ack for posted slate within 30s; epicboxmsgid not \
-				 stored, tx will not be relay-cancellable"
+				"No relay ack for posted slate (session ended or nothing within \
+				 {:?}); epicboxmsgid not stored, tx will not be relay-cancellable",
+				RELAY_ACK_TIMEOUT
 			);
 		}
 
-		if let Some(l) = container
-			.lock()
-			.listeners
-			.remove(&ListenerInterface::Epicbox)
-		{
-			let _ = l.stop();
-		}
-		// end wait
+		stop_epicbox_listener(&container);
 
 		let slate: Slate = VersionedSlate::into_version(slate.clone(), SlateVersion::V2).into();
 		Ok(slate)
 	}
+
         /// One-shot relay cancel: connect, subscribe, send CancelTx, and block
 	/// until TransactionCancelled (subscriber thread has then already run
 	/// owner::cancel_epicbox_tx) or timeout. Returns Ok on relay confirmation.
@@ -312,7 +355,7 @@ impl EpicboxChannel {
 		};
 
 		let container = Container::new(config.clone());
-		let (tx, _rx): (Sender<bool>, Receiver<bool>) = channel();
+		let (tx, rx): (Sender<BrokerEvent>, Receiver<BrokerEvent>) = channel();
 
 		let listener = start_epicbox(
 			container.clone(),
@@ -328,62 +371,43 @@ impl EpicboxChannel {
 			.listeners
 			.insert(ListenerInterface::Epicbox, listener);
 
-		let teardown = |container: &Arc<Mutex<Container>>| {
-			if let Some(l) = container
-				.lock()
-				.listeners
-				.remove(&ListenerInterface::Epicbox)
-			{
-				let _ = l.stop();
-			}
-		};
-
-		// post_cancel_tx fails fast until Challenge > Subscribe completes
-		//TODO: (Biz) do we need these retries?
-		let mut sent = false;
-		for _ in 0..20 {
-			let res = container
-				.lock()
-				.listener(ListenerInterface::Epicbox)?
-				.cancel(epicboxmsgid);
-			if res.is_ok() {
-				sent = true;
-				break;
-			}
-			std::thread::sleep(std::time::Duration::from_millis(500));
-		}
-		if !sent {
-			teardown(&container);
+		let sub_deadline = std::time::Instant::now() + SUBSCRIBE_TIMEOUT;
+		if !wait_for(&rx, sub_deadline, |ev| {
+			matches!(ev, BrokerEvent::Subscribed)
+		}) {
+			stop_epicbox_listener(&container);
 			return Err(Error::EpicboxTungstenite(
-				"Could not send CancelTx: epicbox subscription did not establish"
-					.to_string()
-					.into(),
+				format!(
+					"Could not send CancelTx: epicbox session ended or the \
+					 subscription did not establish within {:?}",
+					SUBSCRIBE_TIMEOUT
+				)
+				.into(),
 			));
 		}
 
-		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-		let mut confirmed = false;
-		while std::time::Instant::now() < deadline {
-			let ok = container
-				.lock()
-				.listener(ListenerInterface::Epicbox)?
-				.cancel_confirmed(epicboxmsgid);
-			if ok {
-				confirmed = true;
-				break;
-			}
-			std::thread::sleep(std::time::Duration::from_millis(250));
+		if let Err(e) = container
+			.lock()
+			.listener(ListenerInterface::Epicbox)?
+			.cancel(epicboxmsgid)
+		{
+			stop_epicbox_listener(&container);
+			return Err(e);
 		}
 
-		teardown(&container);
+		let confirm_deadline = std::time::Instant::now() + RELAY_ACK_TIMEOUT;
+		let confirmed = wait_for(&rx, confirm_deadline, |ev| {
+			matches!(ev, BrokerEvent::Cancelled { epicboxmsgid: id } if id == epicboxmsgid)
+		});
+
+		stop_epicbox_listener(&container);
 
 		if confirmed {
 			Ok(())
 		} else {
 			Err(Error::EpicboxTungstenite(
 				format!(
-					"No TransactionCancelled from relay for [{}] within 30s; \
-					 relay state unknown, local tx untouched.",
+					"No TransactionCancelled from relay for [{}]: local tx untouched.",
 					epicboxmsgid
 				)
 				.into(),
@@ -397,7 +421,7 @@ pub fn start_epicbox<L, C, K>(
 	wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K> + 'static>>>,
 	keychain_mask: Option<SecretKey>,
 	config: EpicboxConfig,
-	tx: Sender<bool>,
+	tx: Sender<BrokerEvent>,
 	is_node_synced: Arc<AtomicBool>,
 	tor_config: TorConfig,
 ) -> Result<Box<dyn Listener>, Error>
@@ -439,8 +463,24 @@ where
 		}
 	};
 	debug!("Connecting to the epicbox server at {} ..", url.clone());
-	let (socket, _) = connect(url.clone()).expect(CONNECTION_ERR_MSG);
+	let (mut socket, _) = connect(url.clone()).expect(CONNECTION_ERR_MSG);
 
+	match socket.get_mut() {
+		MaybeTlsStream::Plain(stream) => {
+			stream
+				.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+				.expect("Could not configure epicbox read timeout");
+		}
+		MaybeTlsStream::NativeTls(stream) => {
+			stream
+				.get_ref()
+				.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+				.expect("Could not configure epicbox read timeout");
+		}
+		_ => {
+			warn!("Unable to configure epicbox read timeout for this TLS backend");
+		}
+	}
 	let publisher =
 		EpicboxPublisher::new(address.clone(), sec_key, socket, tx, "send".to_string())?;
 	let subscriber = EpicboxSubscriber::new(&publisher, is_node_synced)?;
@@ -460,10 +500,9 @@ where
 		)
 		.expect("Could not init epicbox controller!");
 
-		csubscriber
-			.start(controller)
-			.expect("Could not start epicbox controller!");
-		()
+		if let Err(e) = csubscriber.start(controller) {
+			warn!("Epicbox subscriber ended abnormally: {}", e);
+		}
 	});
 
 	Ok(Box::new(EpicboxListener {
@@ -499,10 +538,6 @@ impl Listener for EpicboxListener {
 		self.publisher.cancel_tx(epicboxmsgid)
 	}
 
-	fn cancel_confirmed(&self, epicboxmsgid: &str) -> bool {
-		self.publisher.broker.cancel_confirmed.lock().as_deref() == Some(epicboxmsgid)
-	}
-
 	/// stops wss connection
 	fn stop(self: Box<Self>) -> Result<(), Error> {
 		let s = *self;
@@ -517,7 +552,7 @@ impl EpicboxPublisher {
 		address: EpicboxAddress,
 		secret_key: SecretKey,
 		socket: WebSocket<MaybeTlsStream<TcpStream>>,
-		tx: Sender<bool>,
+		tx: Sender<BrokerEvent>,
 		wallet_mode: String,
 	) -> Result<Self, Error> {
 		Ok(Self {
@@ -608,7 +643,6 @@ pub trait Listener: Send + 'static {
 	fn publish(&self, slate: &VersionedSlate, to: &String) -> Result<(), Error>;
 	fn cancel(&self, epicboxmsgid: &String) -> Result<(), Error>;
         // true once relay confrms cancellation of given msgid
-	fn cancel_confirmed(&self, epicboxmsgid: &str) -> bool;
 	fn stop(self: Box<Self>) -> Result<(), Error>;
 }
 
@@ -910,31 +944,26 @@ pub trait Publisher: Send {
 #[derive(Clone)]
 pub struct EpicboxBroker {
 	inner: Arc<Mutex<WebSocket<MaybeTlsStream<TcpStream>>>>,
-	tx: Sender<bool>,
-	// cross-thread state for the new cancel_tx mechanics
+	tx: Sender<BrokerEvent>,
 	pending_post: Arc<Mutex<Option<Uuid>>>,
-	// guard against subscribe-before-cancel race, to satisfy server requirements
 	subscribed: Arc<AtomicBool>,
-	//TODO: (Biz) remove this mutex, if we can. Probablt requires replacing Sender<bool>
-	// with an event enum BrokerEvent or similar
-	cancel_confirmed: Arc<Mutex<Option<String>>>,
+	stopping: Arc<AtomicBool>,
 }
 
 impl EpicboxBroker {
 	/// Create a EpicboxBroker,
 	pub fn new(
 		inner: WebSocket<MaybeTlsStream<TcpStream>>,
-		tx: Sender<bool>,
+		tx: Sender<BrokerEvent>,
 	) -> Result<Self, Error> {
 		Ok(Self {
 			inner: Arc::new(Mutex::new(inner)),
 			tx,
 			pending_post: Arc::new(Mutex::new(None)),
 			subscribed: Arc::new(AtomicBool::new(false)),
-			cancel_confirmed: Arc::new(Mutex::new(None)),
+			stopping: Arc::new(AtomicBool::new(false)),
 		})
 	}
-
 	/// Start a listener, passing received messages to the wallet api directly
 	pub fn subscribe<P, L, C, K>(
 		&mut self,
@@ -975,23 +1004,48 @@ impl EpicboxBroker {
 				continue;
 			}
 
-			let err = client.sender.lock().read();
+		let read_result = client.sender.lock().read();
 
-			match err {
-				Err(e) => {
-					*handler.lock().reconnections += 1;
-					error!("Error reading message {:?}", e);
-					handler.lock().on_close(CloseReason::Abnormal(
-						Error::EpicboxWebsocketAbnormalTermination,
-					));
-					match client.sender.lock().close(None) {
-						Ok(_) => error!("Client closed connection"),
-						Err(e) => error!("Client closed connection {:?}", e),
-					}
+		// stop() sets this flag before attempting to acquire the websocket mutex.
+		// Check it immediately after read() releases that mutex.
+		if self
+			.stopping
+			.load(std::sync::atomic::Ordering::SeqCst)
+		{
+			debug!("Subscriber loop ending after stop()");
+			handler.lock().on_close(CloseReason::Normal);
+			break Ok(());
+		}
 
-					break Err(Error::EpicboxWebsocketAbnormalTermination);
+		match read_result {
+			// A configured socket read timeout is expected. It lets this loop
+			// periodically release the websocket mutex and observe stopping state
+			Err(ErrorTungstenite::Io(ref e))
+				if matches!(
+					e.kind(),
+					std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+				) =>
+			{
+				continue;
+			}
+
+			Err(e) => {
+				*handler.lock().reconnections += 1;
+				error!("Error reading message {:?}", e);
+				handler.lock().on_close(CloseReason::Abnormal(
+					Error::EpicboxWebsocketAbnormalTermination,
+				));
+
+				match client.sender.lock().close(None) {
+					Ok(_) => error!("Client closed connection"),
+					Err(e) => error!("Client closed connection {:?}", e),
 				}
-				Ok(message) => match message {
+
+				break Err(Error::EpicboxWebsocketAbnormalTermination);
+			}
+
+			Ok(message) => match message {
+				// Keep the entire existing message-handling match here unchanged.				Ok(message) => match message {
 					Message::Text(_) | Message::Binary(_) => {
 						let response = match serde_json::from_str::<ProtocolResponseV2>(
 							&message.to_string(),
@@ -1031,12 +1085,16 @@ impl EpicboxBroker {
 									signature,
 								};
 
-								let _ = client.send(&request_sub).map_err(|e| {
-									error!("Error attempting to send Subscribe {:?}", e)
-								});
-								// cancel_tx may now be permitted, since we are subscribed veritably
-								self.subscribed
-									.store(true, std::sync::atomic::Ordering::SeqCst);
+								match client.send(&request_sub) {
+									Ok(()) => {
+										self.subscribed
+											.store(true, std::sync::atomic::Ordering::SeqCst);
+										let _ = client.tx.send(BrokerEvent::Subscribed);
+									}
+									Err(e) => {
+										error!("Error attempting to send Subscribe {:?}", e);
+									}
+								}
 							}
 							ProtocolResponseV2::Slate {
 								from,
@@ -1108,24 +1166,23 @@ impl EpicboxBroker {
 								);
 
 								client.handler.lock().on_tx_cancelled(&epicboxmsgid);
-								// set mutex indicating we have heard back from server
-								*self.cancel_confirmed.lock() = Some(epicboxmsgid.clone());
 
-								let signature = sign_challenge(
-									&client.challenge.clone().unwrap(),
-									&secret_key,
-								)?
-								.to_hex();
+								let _ = client.tx.send(BrokerEvent::Cancelled {
+									epicboxmsgid: epicboxmsgid.clone(),
+								});
 
-								//TODO: do we need this? we re-subscribe when we handle slates typically
-								let request_sub = ProtocolRequestV2::Subscribe {
-									address: client.address.public_key.to_string(),
-									ver: ver.to_string(),
-									signature,
-								};
-
-								if let Err(e) = client.send(&request_sub) {
-									error!("Could not send subscribe request after cancellation: {}", e);
+								if wallet_mode != "send" {
+									if let Some(ch) = client.challenge.clone() {
+										let signature = sign_challenge(&ch, &secret_key)?.to_hex();
+										let request_sub = ProtocolRequestV2::Subscribe {
+											address: client.address.public_key.to_string(),
+											ver: ver.to_string(),
+											signature,
+										};
+										if let Err(e) = client.send(&request_sub) {
+											error!("Could not send subscribe request after cancellation: {}", e);
+										}
+									}
 								}
 							}
 							ProtocolResponseV2::GetVersion { str } => {
@@ -1157,8 +1214,11 @@ impl EpicboxBroker {
 													.lock()
 													.on_post_slate_ack(&slate_id, &msgid);
 												// unblock a send-mode caller
-												// waiting on the ack (E2)
-												let _ = client.tx.send(true);
+												// waiting on the ack
+												let _ = client.tx.send(BrokerEvent::PostAck {
+													slate_id,
+													epicboxmsgid: msgid.clone(),
+												});
 											}
 											None => {
 												warn!(
@@ -1246,9 +1306,6 @@ impl EpicboxBroker {
                 //TODO: (Biz) do we need this? can't we just handle this and tolerate the
                 // Invalid request?
 
-		// server requires that a subscribe must have completed on this same
-		// connection, else it replies InvalidRequest. Fail fast locally instead of
-                // round-tripping.
 		if !self.subscribed.load(std::sync::atomic::Ordering::SeqCst) {
 			return Err(Error::EpicboxTungstenite(
 				"CancelTx requires an active epicbox subscription on this connection"
@@ -1270,13 +1327,18 @@ impl EpicboxBroker {
 			.lock()
 			.send(Message::Text(
 				serde_json::to_string(&request).unwrap().into(),
-			))
-			.map_err(|e| {
-				Error::EpicboxTungstenite(format!("Could not send CancelTx: {}", e).into())
-			})
+			)).unwrap();
+//			.map_err(|e| {
+//				Error::EpicboxTungstenite(format!("Could not send CancelTx: {}", e).into())
+//			})
+                Ok(())
 	}
 
 	fn stop(&self) -> Result<(), tungsteniteError> {
+		// order matters. mark before closing, so the read loop's error
+		// branch sees the flag when the blocked read() fails
+		self.stopping
+			.store(true, std::sync::atomic::Ordering::SeqCst);
 		self.inner.lock().close(None)
 	}
 }
@@ -1293,7 +1355,7 @@ where
 	challenge: Option<String>,
 	address: EpicboxAddress,
 	secret_key: SecretKey,
-	tx: Sender<bool>,
+	tx: Sender<BrokerEvent>,
 }
 
 /// client with handler from ws package
@@ -1315,7 +1377,7 @@ where
 
 		match self.send(&request) {
 			Ok(_) => {
-				self.tx.send(true).unwrap();
+				self.tx.send(BrokerEvent::Made);
 				Ok(())
 			}
 			Err(e) => Err(Error::EpicboxTungstenite(
