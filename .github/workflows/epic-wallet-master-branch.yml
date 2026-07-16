@@ -14,10 +14,6 @@ on:
   schedule:
     - cron: '0 2 * * *'
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
   build-and-test:
     # Prevent scheduled/push runs in forks of the repository.
