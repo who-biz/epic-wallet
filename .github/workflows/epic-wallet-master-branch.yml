@@ -8,16 +8,25 @@ on:
   pull_request:
     branches:
       - master
-    types: [opened, synchronize, reopened]
+
+  workflow_dispatch:
+
+  schedule:
+    - cron: '0 2 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-and-test:
-    # Prevent this job from running in forks of the repository.
+    # Prevent scheduled/push runs in forks of the repository.
     if: github.repository == 'EpicCash/epic-wallet'
 
     runs-on: ${{ matrix.os }}
 
     strategy:
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -29,10 +38,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
