@@ -49,7 +49,9 @@ const USER_MESSAGE_MAX_LEN: usize = 256;
 /// Shape check for a relay message uid(32), exactly 32 alphanumeric
 /// chars. Mirrors the relay's /^[A-Za-z0-9]{32}$/ canceltx validation.
 fn is_epicbox_msg_id(s: &str) -> bool {
-    s.len() == 32 && s.bytes().all(|b| b.is_ascii_alphanumeric())
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// List of accounts

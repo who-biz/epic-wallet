@@ -613,8 +613,10 @@ fn parse_required<'a>(args: &'a ArgMatches, name: &str) -> Result<&'a str, Error
 }
 
 //TODO: (Biz) consolidate duplicate code, we have 4 of these i think
-fn is_epicbox_msg_id_arg(s: &str) -> bool {
-    s.len() == 32 && s.bytes().all(|b| b.is_ascii_alphanumeric())
+fn is_epicbox_msg_id(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 // parses a number, or throws error with message otherwise
@@ -1232,9 +1234,9 @@ pub fn parse_cancel_args(args: &ArgMatches) -> Result<command::CancelArgs, Error
     let epicbox_msg_id = match args.get_one::<String>("epicbox_msg_id") {
         None => None,
         Some(e) => {
-            if !is_epicbox_msg_id_arg(e) {
+            if !is_epicbox_msg_id(e) {
                 let msg = format!(
-                    "Invalid epicbox_msg_id '{}': expected exactly 32 alphanumeric characters (the relay message id, not the wallet slate UUID).",
+                    "Invalid epicbox_msg_id '{}': expected exactly 32 characters (the relay message id, not the wallet slate UUID).",
                     e
                 );
                 return Err(Error::ArgumentError(msg));
