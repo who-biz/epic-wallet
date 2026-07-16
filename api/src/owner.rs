@@ -768,6 +768,10 @@ where
 						Some(&m) => Some(m.to_owned()),
 					};
 
+					//TODO: can we avoid locking until we know that server has confirmed
+					// receipt of the slate? We need to cancel manually if it fails, in this ordering
+					self.tx_lock_outputs(keychain_mask, &slate, 0, Some(sa.dest))?;
+
 					slate = epicbox_channel.send(
 						wallet,
 						km,
@@ -775,7 +779,8 @@ where
 						self.is_node_synced.clone(),
 						tor_config_lock.clone().unwrap_or_default(),
 					)?;
-					self.tx_lock_outputs(keychain_mask, &slate, 0, Some(sa.dest))?;
+					//TODO: original location of lock
+					//self.tx_lock_outputs(keychain_mask, &slate, 0, Some(sa.dest))?;
 					return Ok(slate);
 				} else {
 					let comm_adapter = create_sender(&sa.method, &sa.dest, is_node_synced)

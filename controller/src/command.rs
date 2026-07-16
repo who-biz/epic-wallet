@@ -575,6 +575,11 @@ where
                         let tor_conf = tor_config
                             .clone()
                             .expect("TorConfig is required for epicbox send");
+
+                        //TODO: can we avoid locking until we know that server has confirmed
+                        // receipt of the slate? We need to cancel manually if it fails, in this ordering
+                        api.tx_lock_outputs(m, &slate, 0, Some(args.dest))?;
+
                         slate = epicbox_channel.send(
                             wallet,
                             km,
@@ -582,8 +587,8 @@ where
                             is_node_synced.clone(),
                             tor_conf,
                         )?;
-
-                        api.tx_lock_outputs(m, &slate, 0, Some(args.dest))?;
+                        //TODO: original lock location
+                        //api.tx_lock_outputs(m, &slate, 0, Some(args.dest))?;
 
                         return Ok(());
                     }
