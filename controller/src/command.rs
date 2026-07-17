@@ -580,7 +580,7 @@ where
                         // receipt of the slate? We need to cancel manually if it fails, in this ordering
                         api.tx_lock_outputs(m, &slate, 0, Some(args.dest))?;
 
-                        slate = epicbox_channel.send(
+                        let _ = epicbox_channel.send(
                             wallet,
                             km,
                             &slate,

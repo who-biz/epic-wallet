@@ -51,10 +51,8 @@ use std::string::ToString;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::spawn;
-use std::time::Duration;
 
 use tungstenite::connect;
-use tungstenite::Error as tungsteniteError;
 use tungstenite::{protocol::WebSocket, stream::MaybeTlsStream};
 use tungstenite::{Error as ErrorTungstenite, Message};
 
@@ -165,7 +163,7 @@ impl EpicboxListenChannel {
 			let k = w_inst.keychain((&mask).as_ref())?;
 			let parent_key_id = w_inst.parent_key_id();
 			let sec_key = address::address_from_derivation_path(&k, &parent_key_id, 0)?;
-			let pub_key = PublicKey::from_secret_key(k.secp(), &sec_key).unwrap();
+			let pub_key = PublicKey::from_secret_key(k.secp(), &sec_key)?;
 
 			let address = EpicboxAddress::new(
 				pub_key.clone(),
@@ -438,7 +436,7 @@ where
 		let k = w_inst.keychain(keychain_mask.as_ref())?;
 		let parent_key_id = w_inst.parent_key_id();
 		let sec_key = address::address_from_derivation_path(&k, &parent_key_id, 0)?;
-		let pub_key = PublicKey::from_secret_key(k.secp(), &sec_key).unwrap();
+		let pub_key = PublicKey::from_secret_key(k.secp(), &sec_key)?;
 
 		let address = EpicboxAddress::new(
 			pub_key.clone(),
@@ -574,7 +572,7 @@ impl Publisher for EpicboxPublisher {
 		self.broker
 			.post_slate(slate, &to, &self.address, &self.secret_key)?;
 		if close_connection {
-			self.broker.stop().unwrap();
+			self.broker.stop();
 		}
 		Ok(())
 	}
@@ -1130,8 +1128,8 @@ impl EpicboxBroker {
 								let signature = sign_challenge(
 									&client.challenge.clone().unwrap(),
 									&secret_key,
-								)?
-								.to_hex();
+								)?.to_hex();
+
 								let request_sub = ProtocolRequestV2::Subscribe {
 									address: client.address.public_key.to_string(),
 									ver: ver.to_string(),
@@ -1264,9 +1262,9 @@ impl EpicboxBroker {
 		let skey = secret_key.clone();
 
 		let message =
-			EncryptedMessage::new(serde_json::to_string(&slate).unwrap(), &to, &pkey, &skey)?;
+			EncryptedMessage::new(serde_json::to_string(&slate)?, &to, &pkey, &skey)?;
 
-		let message_ser = serde_json::to_string(&message).unwrap();
+		let message_ser = serde_json::to_string(&message)?;
 		let mut challenge = String::new();
 		challenge.push_str(&message_ser);
 
@@ -1287,9 +1285,12 @@ impl EpicboxBroker {
 		self.inner
 			.lock()
 			.send(Message::Text(
-				serde_json::to_string(&request).unwrap().into(),
+				serde_json::to_string(&request)?.into(),
 			))
-			.unwrap();
+			.map_err(|e| {
+				*self.pending_post.lock() = None;
+				Error::EpicboxTungstenite(format!("Could not send PostSlate: {}", e).into())
+			})?;
 
 		debug!("Slate sent successfully!");
 
@@ -1326,20 +1327,16 @@ impl EpicboxBroker {
 		self.inner
 			.lock()
 			.send(Message::Text(
-				serde_json::to_string(&request).unwrap().into(),
-			)).unwrap();
-//			.map_err(|e| {
-//				Error::EpicboxTungstenite(format!("Could not send CancelTx: {}", e).into())
-//			})
+				serde_json::to_string(&request)?.into(),
+			))
+			.map_err(|e| {
+				Error::EpicboxTungstenite(format!("Could not send CancelTx: {}", e).into())
+			})?;
                 Ok(())
 	}
 
-	fn stop(&self) -> Result<(), tungsteniteError> {
-		// order matters. mark before closing, so the read loop's error
-		// branch sees the flag when the blocked read() fails
-		self.stopping
-			.store(true, std::sync::atomic::Ordering::SeqCst);
-		self.inner.lock().close(None)
+	fn stop(&self) {
+		self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
 	}
 }
 
@@ -1377,7 +1374,7 @@ where
 
 		match self.send(&request) {
 			Ok(_) => {
-				self.tx.send(BrokerEvent::Made);
+				let _ = self.tx.send(BrokerEvent::Made);
 				Ok(())
 			}
 			Err(e) => Err(Error::EpicboxTungstenite(
