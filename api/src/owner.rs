@@ -1263,9 +1263,10 @@ where
 		keychain_mask: Option<&SecretKey>,
 		tx_id: Option<u32>,
 		epicbox_msg_id: Option<String>,
+		slate_uuid: Option<Uuid>,
 	) -> Result<(), Error> {
-		let msgid = match (epicbox_msg_id, tx_id) {
-			(Some(e), None) => {
+		let msgid = match (epicbox_msg_id, tx_id, slate_uuid) {
+			(Some(e), None, None) => {
 				// epic-wallet cancel -e <epicbox_msg_id> path. checks that epicboxmsgid exists
                                 // before any interaction with networked code
 				let res =
@@ -1282,7 +1283,7 @@ where
 				}
 				e
 			}
-			(None, Some(id)) => {
+			(None, Some(id), None) => {
 				// epic-wallet cancel -i <x> -m epicbox path. checks that tx at index x exists && 
                                 // has associated epicboxmsgid before any interaction with networked code
 				let res =
@@ -1292,9 +1293,25 @@ where
 				})?;
 				entry.epicbox_msg_id.ok_or_else(|| {
 					Error::GenericError(format!(
-						"Transaction {} has no stored epicbox message id; it cannot be \
+						"Transaction with numerical id {} has no stored epicbox message id; it cannot be \
 						 cancelled via the relay. Use the standard cancel for a local cancel.",
 						id
+					))
+				})?
+			}
+			(None, None, Some(slate_id)) => {
+				// epic-wallet cancel uuid path. checks that tx at index x exists && 
+                                // has associated epicboxmsgid before any interaction with networked code
+				let res =
+					self.retrieve_txs(keychain_mask, false, None, Some(slate_id), None, None, None)?;
+				let entry = res.txs.into_iter().next().ok_or_else(|| {
+					Error::GenericError(format!("Transaction with slate_id {} not found", slate_id))
+				})?;
+				entry.epicbox_msg_id.ok_or_else(|| {
+					Error::GenericError(format!(
+						"Transaction with slate_id {} has no stored epicbox message id; it cannot be \
+						 cancelled via the relay. Use the standard cancel for a local cancel.",
+						slate_id
 					))
 				})?
 			}

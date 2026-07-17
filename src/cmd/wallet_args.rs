@@ -1261,12 +1261,12 @@ pub fn parse_cancel_args(args: &ArgMatches) -> Result<command::CancelArgs, Error
     }
 
     // relay is msgid addressed. a UUID cannot be sent to it
-    if method_is_epicbox && tx_slate_id.is_some() {
+    /*if method_is_epicbox && tx_slate_id.is_some() {
         let msg = format!(
             "'-m epicbox' cannot be combined with 'txid' (-t). Use '-i <index>' (the wallet looks up the stored message id) or '-e <epicbox_msg_id>'."
         );
         return Err(Error::ArgumentError(msg));
-    }
+    }*/
 
     Ok(command::CancelArgs {
         tx_id,
