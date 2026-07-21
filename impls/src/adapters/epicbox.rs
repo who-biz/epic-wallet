@@ -315,24 +315,63 @@ impl EpicboxChannel {
 
 		let vslate = VersionedSlate::into_version(slate.clone(), SlateVersion::V2);
 
+		/*
+ 		Generate A in the initiating wallet.
+
+		 Uuid::to_string() contains four hyphens. Removing them produces exactly
+ 		32 hexadecimal characters, satisfying the Epicbox ID validation.
+		*/
+		let epicboxtxid = Uuid::new_v4()
+			.to_string()
+			.replace('-', "");
+
 		if let Err(e) = container
 			.lock()
 			.listener(ListenerInterface::Epicbox)?
-			.publish(&vslate, &self.dest, None)
+			.publish(
+				&vslate,
+				&self.dest,
+				Some(&epicboxtxid),
+			)
 		{
+
+
 			stop_epicbox_listener(&container);
 			return Err(e);
 		}
 
 		let ack_deadline = std::time::Instant::now() + RELAY_ACK_TIMEOUT;
-		if !wait_for(&rx, ack_deadline, |event| {
-			matches!(event, BrokerEvent::PostAck { .. })
-		}) {
-			warn!(
-				"No relay acknowledgement for posted Slate within {:?}; \
-				 the stable epicboxtxid was not confirmed as stored",
-				RELAY_ACK_TIMEOUT
-			);
+		let acknowledged = wait_for(
+			&rx,
+			ack_deadline,
+			|event| {
+				match event {
+					BrokerEvent::PostAck {
+						slate_id,
+						epicboxtxid: acknowledged_txid,
+					} => {
+						slate_id == &slate.id &&
+							acknowledged_txid == &epicboxtxid
+					}
+
+					_ => false,
+				}
+			},
+		);
+
+		if !acknowledged {
+			stop_epicbox_listener(&container);
+
+			return Err(Error::EpicboxTungstenite(
+				format!(
+					"No relay acknowledgement for Slate [{}] and \
+					 epicboxtxid [{}] within {:?}",
+					slate.id,
+					epicboxtxid,
+					RELAY_ACK_TIMEOUT
+				)
+				.into(),
+			));
 		}
 
 		stop_epicbox_listener(&container);
