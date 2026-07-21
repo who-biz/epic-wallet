@@ -155,7 +155,7 @@ where
         let mut amount_debited = 0;
         t.num_inputs = lock_inputs.len();
         for id in lock_inputs {
-            let mut coin = batch.get(&id.0, &id.1).unwrap();
+            let mut coin = batch.get(&id.0, &id.1)?;
             coin.tx_log_entry = Some(log_id);
             amount_debited = amount_debited + coin.value;
             batch.lock_output(&mut coin)?;
