@@ -557,8 +557,16 @@ impl Listener for EpicboxListener {
 
 	fn stop(self: Box<Self>) -> Result<(), Error> {
 		let listener = *self;
+
 		listener.subscriber.stop();
-		let _ = listener.handle.join();
+
+		/*
+		 Do not indefinitely block the Dart FFI caller while waiting for a
+		 network-reader thread. The configured read timeout should allow the
+		 detached thread to observe `stopping` and exit shortly afterward.
+		*/
+		drop(listener.handle);
+
 		Ok(())
 	}
 }
@@ -1070,24 +1078,30 @@ impl EpicboxBroker {
 		let wallet_mode = wallet_mode;
 
 		loop {
-			if !is_node_synced.load(std::sync::atomic::Ordering::SeqCst) {
-				warn!("Node not synced, pausing Epicbox message processing...");
-				std::thread::sleep(std::time::Duration::from_secs(5));
-				continue;
-			}
-
-			let read_result = client.sender.lock().read();
-
-			// stop() sets this flag before trying to acquire the websocket mutex.
-			// Check it after read() releases that mutex.
 			if self
 				.stopping
 				.load(std::sync::atomic::Ordering::SeqCst)
 			{
 				debug!("Subscriber loop ending after stop()");
-				handler.lock().on_close(CloseReason::Normal);
+				handler.lock().on_close(
+					CloseReason::Normal,
+				);
 				break Ok(());
 			}
+
+			if !is_node_synced.load(
+				std::sync::atomic::Ordering::SeqCst,
+			) {
+				warn!("Node not synced, pausing Epicbox message processing...");
+
+				std::thread::sleep(
+					std::time::Duration::from_millis(250),
+				);
+
+				continue;
+			}
+
+			let read_result = client.sender.lock().read();
 
 			match read_result {
 				Err(ErrorTungstenite::Io(ref e))
