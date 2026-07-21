@@ -104,13 +104,13 @@ pub enum BrokerEvent {
 
 /// Metadata for one PostSlate that is waiting for its relay acknowledgement.
 ///
-/// `epicboxtxid` is absent for the initial state, because the destination
-/// relay creates the stable transaction identifier. Every later state carries
-/// the already-established identifier forward.
+/// Every PostSlate carries the sender-generated, transaction-wide
+/// `epicboxtxid`. The relay only echoes it in the PostSlate acknowledgement;
+/// it never creates or replaces it.
 #[derive(Debug, Clone)]
 struct PendingPost {
 	slate_id: Uuid,
-	epicboxtxid: Option<String>,
+	epicboxtxid: String,
 }
 
 #[derive(Clone)]
@@ -295,8 +295,22 @@ impl EpicboxChannel {
 
 		let container = Container::new(config.clone());
 
+		/*
+		 Generate and persist A before any network operation. Retrying the same
+		 Slate reuses the already-stored transaction-wide ID.
+		*/
+		let candidate_epicboxtxid = Uuid::new_v4()
+			.to_string()
+			.replace('-', "");
+		let epicboxtxid = owner::set_tx_epicbox_msg_id_if_empty(
+			wallet.clone(),
+			keychain_mask.as_ref(),
+			&slate.id,
+			&candidate_epicboxtxid,
+		)?;
+
 		// Keep the one-shot session alive until the relay acknowledges the
-		// PostSlate and the stable epicboxtxid has been persisted locally.
+		// PostSlate. A is already durable locally at this point.
 		let (tx, rx): (Sender<BrokerEvent>, Receiver<BrokerEvent>) = channel();
 		let listener = start_epicbox(
 			container.clone(),
@@ -315,27 +329,11 @@ impl EpicboxChannel {
 
 		let vslate = VersionedSlate::into_version(slate.clone(), SlateVersion::V2);
 
-		/*
- 		Generate A in the initiating wallet.
-
-		 Uuid::to_string() contains four hyphens. Removing them produces exactly
- 		32 hexadecimal characters, satisfying the Epicbox ID validation.
-		*/
-		let epicboxtxid = Uuid::new_v4()
-			.to_string()
-			.replace('-', "");
-
 		if let Err(e) = container
 			.lock()
 			.listener(ListenerInterface::Epicbox)?
-			.publish(
-				&vslate,
-				&self.dest,
-				Some(&epicboxtxid),
-			)
+			.publish(&vslate, &self.dest, &epicboxtxid)
 		{
-
-
 			stop_epicbox_listener(&container);
 			return Err(e);
 		}
@@ -580,7 +578,7 @@ impl Listener for EpicboxListener {
 		&self,
 		slate: &VersionedSlate,
 		to: &String,
-		epicboxtxid: Option<&String>,
+		epicboxtxid: &String,
 	) -> Result<(), Error> {
 		let address = EpicboxAddress::from_str(to)?;
 
@@ -633,7 +631,7 @@ impl Publisher for EpicboxPublisher {
 		slate: &VersionedSlate,
 		to: &EpicboxAddress,
 		close_connection: bool,
-		epicboxtxid: Option<&String>,
+		epicboxtxid: &String,
 	) -> Result<(), Error> {
 		self.broker.post_slate(
 			slate,
@@ -717,7 +715,7 @@ pub trait Listener: Send + 'static {
 		&self,
 		slate: &VersionedSlate,
 		to: &String,
-		epicboxtxid: Option<&String>,
+		epicboxtxid: &String,
 	) -> Result<(), Error>;
 
 	fn cancel(&self, epicboxtxid: &String) -> Result<(), Error>;
@@ -894,12 +892,6 @@ pub trait SubscriptionHandler: Send {
 		candidate_epicboxtxid: &String,
 	) -> Result<(), Error>;
 
-	fn on_post_slate_ack(
-		&self,
-		tx_slate_id: &Uuid,
-		candidate_epicboxtxid: &String,
-	) -> Result<String, Error>;
-
 	fn on_tx_cancelled(&self, epicboxtxid: &String);
 	fn on_close(&self, result: CloseReason);
 }
@@ -944,10 +936,8 @@ where
 			tx_proof,
 		)?;
 
-		// This owner helper must atomically preserve an existing stable ID and
-		// return the effective value: either the pre-existing ID or the newly
-		// stored candidate. Returning the effective value is required when a
-		// legacy relay omits epicboxtxid on a later negotiation state.
+		// Atomically preserve the transaction-wide ID already associated with
+		// this Slate. Every protocol state is required to carry the same A.
 		let stable_epicboxtxid = owner::set_tx_epicbox_msg_id_if_empty(
 			self.wallet.clone(),
 			self.keychain_mask.as_ref(),
@@ -970,34 +960,13 @@ where
 				&response_slate,
 				from,
 				false,
-				Some(&stable_epicboxtxid),
+				&stable_epicboxtxid,
 			)?;
 		} else {
 			info!("Slate [{}] finalized successfully", tx_slate_id);
 		}
 
 		Ok(())
-	}
-
-	fn on_post_slate_ack(
-		&self,
-		tx_slate_id: &Uuid,
-		candidate_epicboxtxid: &String,
-	) -> Result<String, Error> {
-		let stable_epicboxtxid = owner::set_tx_epicbox_msg_id_if_empty(
-			self.wallet.clone(),
-			self.keychain_mask.as_ref(),
-			tx_slate_id,
-			candidate_epicboxtxid,
-		)?;
-
-		info!(
-			"Stored stable epicboxtxid [{}] for Slate [{}]",
-			stable_epicboxtxid,
-			tx_slate_id
-		);
-
-		Ok(stable_epicboxtxid)
 	}
 
 	fn on_tx_cancelled(&self, epicboxtxid: &String) {
@@ -1055,7 +1024,7 @@ pub trait Publisher: Send {
 		slate: &VersionedSlate,
 		to: &EpicboxAddress,
 		close_connection: bool,
-		epicboxtxid: Option<&String>,
+		epicboxtxid: &String,
 	) -> Result<(), Error>;
 
 	fn cancel_tx(&self, epicboxtxid: &String) -> Result<(), Error>;
@@ -1172,20 +1141,25 @@ impl EpicboxBroker {
 				}
 
 				Ok(message) => match message {
-					Message::Text(_) | Message::Binary(_) => {
+					Message::Text(text) => {
+						let response_text = text.to_string();
+						info!("Raw Epicbox response: {}", response_text);
+
 						let response = match serde_json::from_str::<ProtocolResponseV2>(
-							&message.to_string(),
+							&response_text,
 						) {
 							Ok(response) => response,
 							Err(e) => {
 								error!(
-									"Could not parse Epicbox response: {:?}\nMessage was: {}",
-									e,
-									message.to_string()
+									"Unable to deserialize Epicbox response [{}]: {}",
+									response_text,
+									e
 								);
 								continue;
 							}
 						};
+
+						debug!("Parsed Epicbox response: {:?}", response);
 
 						*handler.lock().reconnections = 0;
 
@@ -1244,11 +1218,17 @@ impl EpicboxBroker {
 									}
 								};
 
-								// New relays provide the stable ID explicitly. For an old
-								// relay, the per-message ID is a candidate used only if the
-								// TxLogEntry does not already contain a stable ID.
-								let candidate_epicboxtxid = epicboxtxid
-									.unwrap_or_else(|| epicboxmsgid.clone());
+								let candidate_epicboxtxid = match epicboxtxid {
+									Some(epicboxtxid) => epicboxtxid,
+									None => {
+										error!(
+											"Rejecting Slate message [{}] without required \
+											 epicboxtxid",
+											epicboxmsgid
+										);
+										continue;
+									}
+								};
 
 								let proof_address = tx_proof.address.clone();
 								if let Err(e) = client.handler.lock().on_slate(
@@ -1360,103 +1340,101 @@ impl EpicboxBroker {
 
 							ProtocolResponseV2::Error {
 								ref kind,
-								description: _,
-							} => match kind {
-								ProtocolError::InvalidRequest => {
+								ref description,
+							} => {
+								error!(
+									"Epicbox protocol error: kind=[{}], description=[{}]",
+									kind,
+									description
+								);
+
+								if matches!(kind, ProtocolError::InvalidRequest) {
 									error!(
 										"Invalid request. Ensure the connected Epicbox \
 										 supports the required protocol fields"
 									);
 								}
-								_ => {
-									error!("ProtocolResponseV2 error: {}", kind);
-								}
-							},
+							}
+
 
 							ProtocolResponseV2::Ok {
 								epicboxmsgid,
 								epicboxtxid,
 							} => {
-								// Plain Ok responses are used by ClientDetails,
-								// Subscribe, and Made. They must not consume a pending
-								// PostSlate acknowledgement.
-								if epicboxmsgid.is_none() && epicboxtxid.is_none() {
-									debug!("Response Ok");
-									continue;
-								}
-
-								let pending = self.pending_post.lock().take();
-								let pending = match pending {
-									Some(pending) => pending,
+								/*
+								 ClientDetails, Subscribe, and Made return plain Ok. A
+								 PostSlate acknowledgement is distinguished by the relay
+								 echoing the sender-generated epicboxtxid.
+								*/
+								let returned_epicboxtxid = match epicboxtxid {
+									Some(epicboxtxid) => epicboxtxid,
 									None => {
-										warn!(
-											"Received relay IDs with no pending PostSlate: \
-											 epicboxmsgid={:?}, epicboxtxid={:?}",
-											epicboxmsgid,
-											epicboxtxid
+										debug!(
+											"Received non-PostSlate Ok: epicboxmsgid={:?}",
+											epicboxmsgid
 										);
 										continue;
 									}
 								};
 
-								if let (Some(expected), Some(returned)) =
-									(pending.epicboxtxid.as_ref(), epicboxtxid.as_ref())
-								{
-									if expected != returned {
-										warn!(
-											"Relay returned epicboxtxid [{}], but the posted \
-											 state carried stable ID [{}]; preserving [{}]",
-											returned,
-											expected,
-											expected
-										);
-									}
-								}
+								let pending = {
+									let mut pending_guard = self.pending_post.lock();
 
-								// A later state must preserve its already-known ID. For
-								// the initial state, prefer the relay's explicit stable ID
-								// and fall back to the first per-message ID from an old relay.
-								let candidate_epicboxtxid = pending
-									.epicboxtxid
-									.clone()
-									.or(epicboxtxid)
-									.or(epicboxmsgid);
-
-								let candidate_epicboxtxid = match candidate_epicboxtxid {
-									Some(id) => id,
-									None => {
-										warn!(
-											"Relay acknowledged PostSlate without an Epicbox ID"
-										);
-										continue;
+									match pending_guard.as_ref() {
+										None => {
+											warn!(
+												"Received PostSlate Ok for epicboxtxid [{}] \
+												 without a pending PostSlate",
+												returned_epicboxtxid
+											);
+											continue;
+										}
+										Some(pending)
+											if pending.epicboxtxid != returned_epicboxtxid =>
+										{
+											warn!(
+												"Ignoring PostSlate Ok for unexpected \
+												 epicboxtxid [{}]; pending Slate [{}] uses [{}]",
+												returned_epicboxtxid,
+												pending.slate_id,
+												pending.epicboxtxid
+											);
+											continue;
+										}
+										Some(_) => pending_guard
+											.take()
+											.expect("pending PostSlate disappeared while locked"),
 									}
 								};
 
-								let stable_epicboxtxid = match client
-									.handler
-									.lock()
-									.on_post_slate_ack(
-										&pending.slate_id,
-										&candidate_epicboxtxid,
-									) {
-									Ok(id) => id,
-									Err(e) => {
-										error!(
-											"Could not persist epicboxtxid [{}] for \
-											 Slate [{}]: {:?}",
-											candidate_epicboxtxid,
-											pending.slate_id,
-											e
-										);
-										continue;
-									}
-								};
+								info!(
+									"Received PostSlate acknowledgement: slate_id=[{}], \
+									 epicboxtxid=[{}], epicboxmsgid={:?}",
+									pending.slate_id,
+									pending.epicboxtxid,
+									epicboxmsgid
+								);
 
-								let _ = client.tx.send(BrokerEvent::PostAck {
+								if let Err(e) = client.tx.send(BrokerEvent::PostAck {
 									slate_id: pending.slate_id,
-									epicboxtxid: stable_epicboxtxid,
-								});
+									epicboxtxid: pending.epicboxtxid,
+								}) {
+									error!("Unable to emit BrokerEvent::PostAck: {}", e);
+								}
 							}
+						}
+					}
+
+					Message::Binary(bytes) => {
+						match String::from_utf8(bytes.to_vec()) {
+							Ok(text) => warn!(
+								"Ignoring unexpected binary Epicbox response: {}",
+								text
+							),
+							Err(e) => warn!(
+								"Ignoring non-UTF-8 binary Epicbox response: {}",
+								e
+							),
 						}
 					}
 
@@ -1480,7 +1458,7 @@ impl EpicboxBroker {
 		to: &EpicboxAddress,
 		from: &EpicboxAddress,
 		secret_key: &SecretKey,
-		epicboxtxid: Option<&String>,
+		epicboxtxid: &String,
 	) -> Result<(), Error> {
 		let public_key = to.public_key()?;
 		let secret_key_copy = secret_key.clone();
@@ -1495,20 +1473,15 @@ impl EpicboxBroker {
 		let message_ser = serde_json::to_string(&message)?;
 		let signature = sign_challenge(&message_ser, secret_key)?.to_hex();
 
-		let epicboxtxidsig = epicboxtxid
-			.map(|id| {
-				sign_challenge(id, secret_key)
-					.map(|signature| signature.to_hex())
-			})
-			.transpose()?;
+		let epicboxtxidsig = sign_challenge(epicboxtxid, secret_key)?.to_hex();
 
 		let request = ProtocolRequest::PostSlate {
 			from: from.stripped(),
 			to: to.stripped(),
 			str: message_ser,
 			signature,
-			epicboxtxid: epicboxtxid.cloned(),
-			epicboxtxidsig,
+			epicboxtxid: Some(epicboxtxid.clone()),
+			epicboxtxidsig: Some(epicboxtxidsig),
 		};
 
 		let slate: Slate = slate.into();
@@ -1526,15 +1499,25 @@ impl EpicboxBroker {
 
 			*pending = Some(PendingPost {
 				slate_id: slate.id.clone(),
-				epicboxtxid: epicboxtxid.cloned(),
+				epicboxtxid: epicboxtxid.clone(),
 			});
 		}
 
+		let request_json = serde_json::to_string(&request)?;
+
+		info!(
+			"Sending Epicbox PostSlate: slate_id=[{}], epicboxtxid=[{}], \
+			 has_epicboxtxidsig=true, to=[{}]",
+			slate.id,
+			epicboxtxid,
+			to.stripped(),
+		);
+
+		info!("PostSlate JSON: {}", request_json);
+
 		self.inner
 			.lock()
-			.send(Message::Text(
-				serde_json::to_string(&request)?.into(),
-			))
+			.send(Message::Text(request_json.into()))
 			.map_err(|e| {
 				*self.pending_post.lock() = None;
 				Error::EpicboxTungstenite(
