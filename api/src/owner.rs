@@ -1300,20 +1300,42 @@ where
 				})?
 			}
 			(None, None, Some(slate_id)) => {
-				// epic-wallet cancel uuid path. checks that tx at index x exists && 
-                                // has associated epicboxmsgid before any interaction with networked code
-				let res =
-					self.retrieve_txs(keychain_mask, false, None, Some(slate_id), None, None, None)?;
+				// epic-wallet cancel UUID path.
+				let res = self.retrieve_txs(keychain_mask, false, None, Some(slate_id), None, None, None)?;
+
 				let entry = res.txs.into_iter().next().ok_or_else(|| {
-					Error::GenericError(format!("Transaction with slate_id {} not found", slate_id))
-				})?;
-				entry.epicbox_msg_id.ok_or_else(|| {
 					Error::GenericError(format!(
-						"Transaction with slate_id {} has no stored epicbox message id; it cannot be \
-						 cancelled via the relay. Use the standard cancel for a local cancel.",
+						"Transaction with slate_id {} not found",
 						slate_id
 					))
-				})?
+				})?;
+
+				match entry.epicbox_msg_id {
+					Some(epicbox_msg_id) => epicbox_msg_id,
+
+					None => {
+						let tx = {
+							let t = self.status_tx.lock();
+							t.clone()
+						};
+
+						owner::cancel_tx(
+							self.wallet_inst.clone(),
+							keychain_mask,
+							&tx,
+							None,
+							Some(slate_id),
+						)
+						.map_err(|e| {
+							Error::GenericError(format!(
+								"Failed to locally cancel transaction with slate_id {}: {}",
+								slate_id, e
+							))
+						})?;
+
+						return Ok(());
+					}
+				}
 			}
 			_ => {
 				return Err(Error::GenericError(
