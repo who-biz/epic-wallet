@@ -46,8 +46,8 @@ use std::{thread, time::Duration};
 
 const USER_MESSAGE_MAX_LEN: usize = 256;
 
-/// Shape check for a relay message uid(32), exactly 32 alphanumeric
-/// chars. Mirrors the relay's /^[A-Za-z0-9]{32}$/ canceltx validation.
+/// Shape check for a relay uid(32): exactly 32 characters from
+/// `[A-Za-z0-9_-]`, matching the relay's validation.
 fn is_epicbox_msg_id(s: &str) -> bool {
     s.len() == 32
         && s.bytes()
@@ -669,48 +669,142 @@ where
     Ok(sl)
 }
 
-/// Persists an epicbox message id returned by the relay alongside the
-/// tx log entry for the given slate UUID. Locks internally. Caller must
-/// not hold the lock (e.g. epicbox adapter)
+/// Atomically associates the stable Epicbox transaction ID with every tx log
+/// entry for the given Slate UUID.
+///
+/// The database field is still named `epicbox_msg_id` for storage compatibility,
+/// but it now contains the stable transaction-wide `epicboxtxid`, not a
+/// per-message `epicboxmsgid`.
+///
+/// If no matching entry has an ID, `candidate_epicboxtxid` is stored.
+/// If an ID is already present, it is preserved and returned. Empty sibling
+/// entries for the same Slate UUID are normalized to that existing ID.
+/// Distinct existing IDs for the same Slate UUID are treated as database
+/// corruption and no changes are committed.
+///
+/// Locks internally. Callers must not already hold the wallet lock.
+pub fn set_tx_epicbox_msg_id_if_empty<'a, L, C, K>(
+    wallet_inst: Arc<Mutex<Box<dyn WalletInst<'a, L, C, K>>>>,
+    keychain_mask: Option<&SecretKey>,
+    tx_slate_id: &Uuid,
+    candidate_epicboxtxid: &str,
+) -> Result<String, Error>
+where
+    L: WalletLCProvider<'a, C, K>,
+    C: NodeClient + 'a,
+    K: Keychain + 'a,
+{
+    if !is_epicbox_msg_id(candidate_epicboxtxid) {
+        return Err(Error::GenericError(format!(
+            "Invalid epicboxtxid (expected 32 characters from [A-Za-z0-9_-]): {}",
+            candidate_epicboxtxid
+        )));
+    }
+
+    wallet_lock!(wallet_inst, w);
+    let parent_key_id = w.parent_key_id();
+
+    let entries: Vec<TxLogEntry> = w
+        .tx_log_iter()
+        .filter(|entry| entry.tx_slate_id == Some(*tx_slate_id))
+        .collect();
+
+    if entries.is_empty() {
+        return Err(Error::GenericError(format!(
+            "No tx log entry found for Slate {}",
+            tx_slate_id
+        )));
+    }
+
+    // Determine whether a stable ID has already been stored. There may be
+    // multiple tx log entries for one Slate UUID, but they must not disagree.
+    let mut existing_epicboxtxid: Option<String> = None;
+
+    for entry in &entries {
+        let Some(stored) = entry.epicbox_msg_id.as_ref() else {
+            continue;
+        };
+
+        if !is_epicbox_msg_id(stored) {
+            return Err(Error::GenericError(format!(
+                "Invalid stored epicboxtxid [{}] for Slate {}",
+                stored, tx_slate_id
+            )));
+        }
+
+        match existing_epicboxtxid.as_ref() {
+            None => {
+                existing_epicboxtxid = Some(stored.clone());
+            }
+            Some(existing) if existing == stored => {}
+            Some(existing) => {
+                return Err(Error::GenericError(format!(
+                    "Conflicting epicboxtxids for Slate {}: [{}] and [{}]",
+                    tx_slate_id, existing, stored
+                )));
+            }
+        }
+    }
+
+    let effective_epicboxtxid = existing_epicboxtxid
+        .unwrap_or_else(|| candidate_epicboxtxid.to_string());
+
+    if effective_epicboxtxid != candidate_epicboxtxid {
+        warn!(
+            "Preserving existing epicboxtxid [{}] for Slate [{}]; \
+             ignoring later candidate [{}]",
+            effective_epicboxtxid,
+            tx_slate_id,
+            candidate_epicboxtxid
+        );
+    }
+
+    // Normalize only entries whose field is empty. Never overwrite A with a
+    // later per-message ID or with a conflicting candidate from another relay.
+    let mut changed_entries = Vec::new();
+
+    for mut entry in entries {
+        if entry.epicbox_msg_id.is_none() {
+            entry.epicbox_msg_id = Some(effective_epicboxtxid.clone());
+            changed_entries.push(entry);
+        }
+    }
+
+    if !changed_entries.is_empty() {
+        let mut batch = w.batch(keychain_mask)?;
+
+        for entry in changed_entries {
+            batch.save_tx_log_entry(entry, &parent_key_id)?;
+        }
+
+        batch.commit()?;
+    }
+
+    Ok(effective_epicboxtxid)
+}
+
+/// Compatibility wrapper for existing callers.
+///
+/// This now has set-if-empty semantics so no caller can accidentally replace
+/// the stable transaction-wide Epicbox ID with a later per-message ID.
 pub fn set_tx_epicbox_msg_id<'a, L, C, K>(
     wallet_inst: Arc<Mutex<Box<dyn WalletInst<'a, L, C, K>>>>,
     keychain_mask: Option<&SecretKey>,
     tx_slate_id: &Uuid,
-    epicbox_msg_id: &str,
+    epicboxtxid: &str,
 ) -> Result<(), Error>
 where
     L: WalletLCProvider<'a, C, K>,
     C: NodeClient + 'a,
     K: Keychain + 'a,
 {
-    if !is_epicbox_msg_id(epicbox_msg_id) {
-        return Err(Error::GenericError(format!(
-            "Invalid epicboxmsgid (expected 32 alphanumeric chars): {}",
-            epicbox_msg_id
-        )));
-    }
-
-    wallet_lock!(wallet_inst, w);
-    let parent_key_id = w.parent_key_id();
-    let entries: Vec<TxLogEntry> = w
-        .tx_log_iter()
-        .filter(|e| e.tx_slate_id == Some(*tx_slate_id))
-        .collect();
-
-    if entries.is_empty() {
-        return Err(Error::GenericError(format!(
-            "No tx log entry found for slate {}",
-            tx_slate_id
-        )));
-    }
-
-    let mut batch = w.batch(keychain_mask)?;
-    for mut entry in entries {
-        entry.epicbox_msg_id = Some(epicbox_msg_id.to_string());
-        batch.save_tx_log_entry(entry, &parent_key_id)?;
-    }
-    batch.commit()?;
-    Ok(())
+    set_tx_epicbox_msg_id_if_empty(
+        wallet_inst,
+        keychain_mask,
+        tx_slate_id,
+        epicboxtxid,
+    )
+    .map(|_| ())
 }
 
 /// Cancels a tx (for use with epicbox, does not have internal lock).
