@@ -1116,6 +1116,28 @@ impl EpicboxBroker {
 			stopping: Arc::new(AtomicBool::new(false)),
 		})
 	}
+
+	/// Node sync wait helper
+	fn wait_for_node_sync(
+		&self,
+		is_node_synced: &Arc<AtomicBool>,
+	) -> bool {
+		if !is_node_synced.load(std::sync::atomic::Ordering::SeqCst) {
+			warn!("Node not synced; holding Epicbox message until sync completes");
+    		}
+
+		while !is_node_synced.load(std::sync::atomic::Ordering::SeqCst) {
+			if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+				debug!("Subscriber stopping while waiting for node sync");
+				return false;
+			}
+
+		        std::thread::sleep(std::time::Duration::from_millis(250));
+		}
+
+		true
+	}
+
 	/// Start a listener, passing received messages to the wallet api directly
 	pub fn subscribe<P, L, C, K>(
 		&mut self,
@@ -1167,18 +1189,6 @@ impl EpicboxBroker {
 
 				handler.lock().on_close(CloseReason::Normal);
 				break Ok(());
-			}
-
-			if !is_node_synced.load(
-				std::sync::atomic::Ordering::SeqCst,
-			) {
-				warn!("Node not synced, pausing Epicbox message processing...");
-
-				std::thread::sleep(
-					std::time::Duration::from_millis(250),
-				);
-
-				continue;
 			}
 
 			let read_result = client.sender.lock().read();
@@ -1276,6 +1286,10 @@ impl EpicboxBroker {
 								epicboxmsgid,
 								epicboxtxid,
 							} => {
+								if !self.wait_for_node_sync(&is_node_synced) {
+									handler.lock().on_close(CloseReason::Normal);
+									return Ok(());
+								}
 								let (slate, mut tx_proof) = match TxProof::from_response(
 									from,
 									str,
@@ -1365,6 +1379,11 @@ impl EpicboxBroker {
 							ProtocolResponseV2::TransactionCancelled {
 								epicboxtxid,
 							} => {
+								if !self.wait_for_node_sync(&is_node_synced) {
+									handler.lock().on_close(CloseReason::Normal);
+									return Ok(());
+								}
+
 								warn!(
 									"Relay confirmed cancellation for epicboxtxid {}",
 									epicboxtxid
