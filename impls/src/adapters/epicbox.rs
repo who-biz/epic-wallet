@@ -1121,13 +1121,14 @@ impl EpicboxBroker {
 	fn wait_for_node_sync(
 		&self,
 		is_node_synced: &Arc<AtomicBool>,
+		should_stop: &dyn Fn() -> bool,
 	) -> bool {
 		if !is_node_synced.load(std::sync::atomic::Ordering::SeqCst) {
 			warn!("Node not synced; holding Epicbox message until sync completes");
     		}
 
 		while !is_node_synced.load(std::sync::atomic::Ordering::SeqCst) {
-			if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+			if self.stopping.load(std::sync::atomic::Ordering::SeqCst) || should_stop() {
 				debug!("Subscriber stopping while waiting for node sync");
 				return false;
 			}
@@ -1286,7 +1287,7 @@ impl EpicboxBroker {
 								epicboxmsgid,
 								epicboxtxid,
 							} => {
-								if !self.wait_for_node_sync(&is_node_synced) {
+								if !self.wait_for_node_sync(&is_node_synced, should_stop) {
 									handler.lock().on_close(CloseReason::Normal);
 									return Ok(());
 								}
@@ -1379,7 +1380,7 @@ impl EpicboxBroker {
 							ProtocolResponseV2::TransactionCancelled {
 								epicboxtxid,
 							} => {
-								if !self.wait_for_node_sync(&is_node_synced) {
+								if !self.wait_for_node_sync(&is_node_synced, should_stop) {
 									handler.lock().on_close(CloseReason::Normal);
 									return Ok(());
 								}
