@@ -83,6 +83,39 @@ const SUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 
 const RELAY_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+const SOCKET_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn configure_socket_read_timeout(
+	socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+) -> Result<(), Error> {
+	match socket.get_mut() {
+		MaybeTlsStream::Plain(stream) => {
+			stream
+				.set_read_timeout(Some(SOCKET_POLL_TIMEOUT))
+				.map_err(|e| {
+					Error::EpicboxTungstenite(
+						format!("Could not configure Epicbox read timeout: {}", e).into(),
+					)
+				})?;
+		}
+		MaybeTlsStream::NativeTls(stream) => {
+			stream
+				.get_ref()
+				.set_read_timeout(Some(SOCKET_POLL_TIMEOUT))
+				.map_err(|e| {
+					Error::EpicboxTungstenite(
+						format!("Could not configure Epicbox read timeout: {}", e).into(),
+					)
+				})?;
+		}
+		_ => {
+			warn!("Unable to configure Epicbox read timeout for this TLS backend");
+		}
+	}
+
+	Ok(())
+}
+
 /// Epicbox 'plugin' implementation
 pub enum CloseReason {
 	Normal,
@@ -159,6 +192,7 @@ impl EpicboxListenChannel {
 		reconnections: &mut u32,
 		is_node_synced: Arc<AtomicBool>,
 		tor_config: TorConfig,
+		should_stop: &dyn Fn() -> bool,
 	) -> Result<(), Error>
 	where
 		L: WalletLCProvider<'static, C, K> + 'static,
@@ -203,11 +237,13 @@ impl EpicboxListenChannel {
 		let (tx, _rx): (Sender<BrokerEvent>, Receiver<BrokerEvent>) = channel();
 
 		debug!("Connecting to the epicbox server at {} ..", url.clone());
-		let (socket, _response) = connect(url.clone()).map_err(|e| {
+		let (mut socket, _response) = connect(url.clone()).map_err(|e| {
 			warn!("{}", Error::EpicboxTungstenite(format!("{}", e).into()));
 			*reconnections += 1;
 			Error::EpicboxTungstenite(format!("{}", e).into())
 		})?;
+
+		configure_socket_read_timeout(&mut socket)?;
 
 		let publisher =
 			EpicboxPublisher::new(address.clone(), sec_key, socket, tx, "listener".to_string())?;
@@ -229,7 +265,7 @@ impl EpicboxListenChannel {
 		.expect("Could not init epicbox listener!");
 
 		info!("Starting epicbox listener for: {}", address);
-		subscriber.start(controller)
+		subscriber.start_with_stop(controller, should_stop)
 	}
 }
 
@@ -517,22 +553,7 @@ where
 	debug!("Connecting to the epicbox server at {} ..", url.clone());
 	let (mut socket, _) = connect(url.clone()).expect(CONNECTION_ERR_MSG);
 
-	match socket.get_mut() {
-		MaybeTlsStream::Plain(stream) => {
-			stream
-				.set_read_timeout(Some(std::time::Duration::from_secs(1)))
-				.expect("Could not configure epicbox read timeout");
-		}
-		MaybeTlsStream::NativeTls(stream) => {
-			stream
-				.get_ref()
-				.set_read_timeout(Some(std::time::Duration::from_secs(1)))
-				.expect("Could not configure epicbox read timeout");
-		}
-		_ => {
-			warn!("Unable to configure epicbox read timeout for this TLS backend");
-		}
-	}
+	configure_socket_read_timeout(&mut socket)?;
 	let publisher =
 		EpicboxPublisher::new(address.clone(), sec_key, socket, tx, "send".to_string())?;
 	let subscriber = EpicboxSubscriber::new(&publisher, is_node_synced)?;
@@ -1001,12 +1022,28 @@ impl EpicboxSubscriber {
 		C: NodeClient + 'static,
 		K: Keychain + 'static,
 	{
+		let should_stop = || false;
+		self.start_with_stop(handler, &should_stop)
+	}
+
+	fn start_with_stop<P, L, C, K>(
+		&mut self,
+		handler: EpicboxController<P, L, C, K>,
+		should_stop: &dyn Fn() -> bool,
+	) -> Result<(), Error>
+	where
+		P: Publisher,
+		L: WalletLCProvider<'static, C, K> + 'static,
+		C: NodeClient + 'static,
+		K: Keychain + 'static,
+	{
 		self.broker.subscribe(
 			&self.address,
 			&self.secret_key,
 			handler,
 			&self.wallet_mode,
 			self.is_node_synced.clone(),
+			should_stop,
 		)
 	}
 
@@ -1059,6 +1096,7 @@ impl EpicboxBroker {
 		handler: EpicboxController<P, L, C, K>,
 		wallet_mode: &String,
 		is_node_synced: Arc<AtomicBool>,
+		should_stop: &dyn Fn() -> bool,
 	) -> Result<(), Error>
 	where
 		P: Publisher,
@@ -1086,8 +1124,9 @@ impl EpicboxBroker {
 			if self
 				.stopping
 				.load(std::sync::atomic::Ordering::SeqCst)
+				|| should_stop()
 			{
-				debug!("Subscriber loop ending after stop()");
+				debug!("Subscriber loop ending after stop request");
 
 				match client.sender.lock().close(None) {
 					Ok(_) => {
