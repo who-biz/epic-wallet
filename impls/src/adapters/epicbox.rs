@@ -184,7 +184,35 @@ impl EpicboxListenChannel {
 	pub fn new() -> Result<EpicboxListenChannel, Error> {
 		Ok(EpicboxListenChannel { _priv: () })
 	}
+
 	pub fn listen<L, C, K>(
+		&self,
+		wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K> + 'static>>>,
+		keychain_mask: Arc<Mutex<Option<SecretKey>>>,
+		epicbox_config: EpicboxConfig,
+		reconnections: &mut u32,
+		is_node_synced: Arc<AtomicBool>,
+		tor_config: TorConfig,
+	) -> Result<(), Error>
+	where
+		L: WalletLCProvider<'static, C, K> + 'static,
+		C: NodeClient + 'static,
+		K: Keychain + 'static,
+	{
+		let should_stop = || false;
+
+		self.listen_with_stop(
+			wallet,
+			keychain_mask,
+			epicbox_config,
+			reconnections,
+			is_node_synced,
+			tor_config,
+			&should_stop,
+		)
+	}
+
+	pub fn listen_with_stop<L, C, K>(
 		&self,
 		wallet: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K> + 'static>>>,
 		keychain_mask: Arc<Mutex<Option<SecretKey>>>,
