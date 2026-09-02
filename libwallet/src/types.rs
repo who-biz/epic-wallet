@@ -857,7 +857,7 @@ pub struct TxLogEntry {
     /// Ok { epicboxmsgid } after PostSlate. Used to correlate/cancel
     /// queued slates on the relay. None for non-epicbox txs, txs relayed
     /// to foreign epicbox domains, or records created before this field.
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub epicbox_tx_id: Option<String>,
     /// Transaction type (as above)
     pub tx_type: TxLogEntryType,
